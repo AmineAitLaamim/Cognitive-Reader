@@ -72,7 +72,7 @@ class TrainerConfig:
     jump_loss_weight: float = 1.0
 
     # === Evaluation ===
-    val_every_n_epochs: int = 5
+    val_every_n_epochs: int = 1
     ood_eval_every_n_epochs: int = 10
     ood_eval_lengths: List[int] = field(default_factory=lambda: [100, 200])
     ood_eval_samples: int = 20
@@ -726,7 +726,7 @@ def main():
         digit_loss_weight=1.0,
         action_loss_weight=1.0,
         jump_loss_weight=1.0,
-        val_every_n_epochs=5,
+        val_every_n_epochs=1,
         ood_eval_every_n_epochs=10,
         ood_eval_lengths=[100, 200],
         ood_eval_samples=20,
