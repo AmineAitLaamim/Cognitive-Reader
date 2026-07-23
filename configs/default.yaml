@@ -1,0 +1,221 @@
+# ============================================================
+# Cognitive Reader — Default Training Configuration
+# ============================================================
+# All hyperparameters for data generation, model architecture,
+# training, and logging. Override any value via command line
+# or by creating a new yaml that inherits from this one.
+# ============================================================
+
+# ----------------------------------------------------------
+# DATA GENERATION
+# ----------------------------------------------------------
+data:
+  # Image canvas
+  img_width: 640
+  img_height: 640
+
+  # Sequence length (training distribution)
+  min_digits: 5
+  max_digits: 50
+
+  # Spatial geometry
+  threshold_radius_r: 80.0        # Core hyperparameter: graph edge threshold (pixels)
+  noise_sigma: 3.0                # Sim2Real detector noise (pixels)
+  # Derived (do not edit — computed automatically):
+  #   r_intra = 0.8 * r = 64.0
+  #   r_inter = 1.5 * r = 120.0
+  #   T_intra = r_intra + 4*sigma = 76.0
+  #   T_inter = r_inter - 4*sigma = 108.0
+
+  # Chunk constraints
+  max_chunk_size: 4               # Max digits per chunk
+  min_chunk_size: 1               # Min digits per chunk
+
+  # Generator sampling
+  r_intra_factor: 0.8             # Max intra-chunk distance = factor * r
+  r_inter_factor: 1.5             # Min inter-chunk distance = factor * r
+  r_max_inter_factor: 2.5         # Max inter-chunk distance = factor * r
+  intra_angle_mean: 0.0           # Mean angle for intra-chunk placement (radians)
+  intra_angle_std: 0.087          # Std of angle (5 degrees in radians)
+  inter_angle_mean: 3.927         # Mean angle for inter-chunk (225 degrees)
+  inter_angle_std: 0.175          # Std of angle (10 degrees)
+  boundary_margin: 40.0           # Keep digits away from canvas edges
+  min_digit_gap: 25.0             # Minimum distance between digits (prevent overlap)
+
+  # Dataset
+  samples_per_epoch: 1000         # Virtual dataset size per epoch
+  seed: 42
+
+# ----------------------------------------------------------
+# RENDERER
+# ----------------------------------------------------------
+renderer:
+  font_size_base: 28              # Base font size (pixels)
+  font_size_jitter: 0.15          # ±15% size variation
+  rotation_max_deg: 5.0           # Max glyph rotation (degrees)
+  digit_color_mean: 30            # Mean digit color (0=black)
+  digit_color_std: 20             # Color variation
+  background_color: [245, 245, 240]  # Off-white canvas
+  bg_noise_std: 3.0               # Background noise
+  blur_probability: 0.3           # Probability of blur augmentation
+  blur_radius_range: [0.3, 0.8]   # Blur radius range
+  brightness_jitter: 0.05         # ±5% brightness
+  contrast_jitter: 0.05           # ±5% contrast
+  padding_factor: 1.2             # RoI Align square padding expansion
+
+  # Normalization (ImageNet)
+  normalize_mean: [0.485, 0.456, 0.406]
+  normalize_std: [0.229, 0.224, 0.225]
+
+  # Heatmap target
+  heatmap_stride: 8
+  heatmap_sigma: 1.0              # Gaussian blob sigma (feature-map pixels)
+
+# ----------------------------------------------------------
+# MODEL ARCHITECTURE
+# ----------------------------------------------------------
+model:
+  # Visual backbone
+  backbone: "resnet18"            # Backbone architecture
+  pretrained: true                # Use ImageNet pretrained weights
+  backbone_stride: 8              # Output stride (modified ResNet-18)
+  backbone_channels: 512          # Output channels
+
+  # RoI Align
+  roi_output_size: 7              # RoI grid size (7x7)
+  roi_padding_factor: 1.2         # Square padding expansion
+
+  # Visual embedding
+  vis_dim: 512                    # Per-node visual embedding dimension
+
+  # Controller
+  hidden_dim: 256                 # h_content GRU hidden dimension
+  edge_dim: 256                   # Edge embedding dimension
+  key_dim: 256                    # Spatial key dimension (Mode 2 attention)
+  num_classes: 10                 # Digit classes (0-9)
+  num_frequencies: 64             # Fourier feature frequency bands
+  num_heads: 4                    # Multi-head attention heads (Mode 2)
+  dropout: 0.1                    # Dropout rate
+
+  # Detector
+  detector_hidden_channels: 128   # Heatmap head hidden channels
+  detection_threshold: 0.3        # Peak confidence threshold
+  detection_top_k: 200            # Max detections per image
+  nms_kernel_size: 3              # NMS window size
+  enable_subpixel: true           # Sub-pixel refinement
+  estimated_digit_w: 20.0         # Estimated digit width (pixels)
+  estimated_digit_h: 30.0         # Estimated digit height (pixels)
+  box_padding_factor: 1.3         # Box expansion for context
+
+  # Inference geometry
+  r_infer_multiplier: 1.2         # r_infer = r_train * multiplier
+
+# ----------------------------------------------------------
+# TRAINING
+# ----------------------------------------------------------
+training:
+  # Optimization
+  learning_rate: 1.0e-4           # Controller LR
+  backbone_lr: 1.0e-5             # Backbone LR (lower for pretrained)
+  weight_decay: 1.0e-4            # Weight decay
+  betas: [0.9, 0.999]             # Adam betas
+  optimizer: "adamw"              # adamw | adam | sgd
+
+  # Schedule
+  num_epochs: 100
+  warmup_epochs: 5
+  scheduler: "cosine"             # cosine | step | constant | none
+  step_size: 30                   # For step scheduler
+  gamma: 0.1                      # For step scheduler
+
+  # Gradient
+  max_grad_norm: 1.0              # Gradient clipping norm
+  gradient_accumulation_steps: 1  # Effective batch = batch_size * accum
+
+  # Batch
+  batch_size: 8
+  num_workers: 4
+
+  # Loss weights
+  loss_weights:
+    digit: 1.0                    # Digit classification loss
+    action: 1.0                   # Mode 1 routing + CHUNK loss
+    jump: 1.0                     # Mode 2 saccadic jump loss
+    heatmap: 1.0                  # Detector heatmap focal loss
+
+  # Loss weight warmup (epochs to ramp from 0 to full weight)
+  loss_warmup:
+    digit: 0                      # Digit loss active from epoch 0
+    action: 0                     # Action loss active from epoch 0
+    jump: 10                      # Jump loss ramps up over 10 epochs
+    heatmap: 0                    # Heatmap loss active from epoch 0
+
+  # Focal loss parameters
+  focal_alpha: 2.0                # Positive focusing
+  focal_beta: 4.0                 # Negative down-weighting
+
+  # EMA
+  use_ema: true
+  ema_decay: 0.999
+
+  # Gradual unfreezing
+  use_gradual_unfreeze: true
+  unfreeze_phase1: 5              # Unfreeze layer3+4 at epoch 5
+  unfreeze_phase2: 15             # Unfreeze all at epoch 15
+
+  # Mixed precision
+  use_amp: false                  # Enable on CUDA for speed
+
+# ----------------------------------------------------------
+# DETECTOR PRE-TRAINING
+# ----------------------------------------------------------
+detector_pretrain:
+  enabled: true                   # Pre-train detector before joint training
+  num_epochs: 30
+  learning_rate: 1.0e-4
+  backbone_lr: 1.0e-5
+  weight_decay: 1.0e-4
+  max_grad_norm: 1.0
+  warmup_epochs: 3
+  batch_size: 16
+  freeze_backbone_epochs: 5       # Freeze backbone for first N epochs
+  checkpoint_dir: "./checkpoints/detector"
+  save_every_n_epochs: 10
+  log_every_n_steps: 50
+
+# ----------------------------------------------------------
+# EVALUATION
+# ----------------------------------------------------------
+evaluation:
+  val_every_n_epochs: 5
+  ood_eval_every_n_epochs: 10
+  ood_eval_lengths: [100, 200]    # OOD lengths during training
+  ood_eval_samples: 20            # Samples per length during training
+
+# ----------------------------------------------------------
+# CHECKPOINTING
+# ----------------------------------------------------------
+checkpoint:
+  dir: "./checkpoints"
+  save_every_n_epochs: 10
+  save_best: true                 # Save best validation checkpoint
+  keep_last_n: 5                  # Keep only last N checkpoints (0 = keep all)
+
+# ----------------------------------------------------------
+# LOGGING
+# ----------------------------------------------------------
+logging:
+  log_dir: "./logs"
+  log_every_n_steps: 50
+  use_tensorboard: true
+  use_wandb: false
+  wandb_project: "cognitive_reader"
+  wandb_entity: ""
+  wandb_tags: []
+  log_histograms: false           # Log gradient/weight histograms
+  log_images_every: 500           # Log sample images every N steps
+
+# ----------------------------------------------------------
+# REPRODUCIBILITY
+# ----------------------------------------------------------
+seed: 42

@@ -1,0 +1,33 @@
+# ============================================================
+# Cognitive Reader — Project Dependencies
+# ============================================================
+
+# --- Core ---
+torch>=2.0.0
+torchvision>=0.15.0
+numpy>=1.24.0
+
+# --- Data & Rendering ---
+Pillow>=9.5.0
+
+# --- Visualization ---
+matplotlib>=3.7.0
+
+# --- Logging ---
+tensorboard>=2.13.0
+
+# --- Configuration ---
+pyyaml>=6.0
+
+# --- Utilities ---
+tqdm>=4.65.0
+
+# --- Optional: Weights & Biases logging ---
+# Uncomment to enable wandb backend in utils/logger.py
+# wandb>=0.15.0
+
+# --- Optional: Faster RoI Align (CUDA only) ---
+# Already included in torchvision. No separate install needed.
+
+# --- Optional: Mixed precision training ---
+# torch.cuda.amp is built into PyTorch >= 1.6. No separate install.
