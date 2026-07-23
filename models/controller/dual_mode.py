@@ -62,11 +62,11 @@ class DualModeOutput:
 class DualModeController(nn.Module):
     """
     The complete Dual-Mode Cognitive Controller.
-    
+
     This is the top-level module that orchestrates Mode 1 and Mode 2,
     manages the ControllerState, and computes the training loss.
     """
-    
+
     def __init__(
         self,
         vis_dim: int = 512,
@@ -83,32 +83,29 @@ class DualModeController(nn.Module):
         loss_weights: Optional[Dict[str, float]] = None
     ):
         super().__init__()
-        
+
         self.vis_dim = vis_dim
         self.hidden_dim = hidden_dim
         self.radius = radius
         self.T_intra = T_intra
         self.T_inter = T_inter
-        
-        # Loss weights for multi-task training
+
         self.loss_weights = loss_weights or {
             'digit': 1.0,
             'action': 1.0,
             'jump': 1.0
         }
-        
+
         # ============================================================
         # Sub-modules
         # ============================================================
-        
-        # Spatial Feature Encoder (Routing Pathway)
+
         self.spatial_encoder = SpatialFeatureEncoder(
             num_frequencies=num_frequencies,
             output_dim=key_dim,
             use_learnable_projection=True
         )
-        
-        # Mode 1: Foveated Read
+
         self.foveated = FoveatedReadModule(
             vis_dim=vis_dim,
             hidden_dim=hidden_dim,
@@ -119,8 +116,7 @@ class DualModeController(nn.Module):
             T_inter=T_inter,
             dropout=dropout
         )
-        
-        # Mode 2: Saccadic Jump
+
         self.saccadic = SaccadicJumpModule(
             key_dim=key_dim,
             vis_dim=vis_dim,
@@ -128,86 +124,114 @@ class DualModeController(nn.Module):
             num_heads=num_heads,
             dropout=dropout
         )
-        
-        # Graph builder (used at inference to construct graph from detector output)
+
         self.graph_builder = ThresholdRadiusGraphBuilder(
             radius=radius,
-            img_width=640,   # Will be overridden per-image
+            img_width=640,
             img_height=640
         )
-    
+
     # ==============================================================
     # FEATURE PRE-COMPUTATION
     # ==============================================================
-    
+
     def _prepare_graph_features(
         self, graph: SpatialGraph
     ) -> Dict[str, torch.Tensor]:
         """
         Pre-compute all spatial features for the graph.
         Called once per image, before the reading loop.
-        
-        Returns dict with:
-          - node_keys: [N, key_dim] — for Mode 2 attention
-          - edge_embeddings: [N, N, edge_dim] — for Mode 1 routing
-          - edge_distances: [N, N] — raw pixel distances
         """
         with torch.no_grad():
-            # Encode node positions for Mode 2 keys
             node_keys = self.spatial_encoder.encode_positions(
                 graph.node_positions_norm
-            )  # [N, key_dim]
-            
-            # Encode edge features for Mode 1 routing
+            )
             edge_embeddings = self.spatial_encoder.encode_edges(
                 graph.edge_features,
                 radius=self.radius
-            )  # [N, N, edge_dim]
-            
-            # Extract raw pixel distances
-            edge_distances = graph.edge_features[:, :, 2]  # [N, N]
-        
+            )
+            edge_distances = graph.edge_features[:, :, 2]
+
         return {
             'node_keys': node_keys,
             'edge_embeddings': edge_embeddings,
             'edge_distances': edge_distances
         }
-    
+
+    # ==============================================================
+    # HELPER: Run foveated on a node and return output
+    # ==============================================================
+
+    def _run_foveated_at_node(
+        self,
+        graph: SpatialGraph,
+        node_idx: int,
+        state: ControllerState,
+        edge_embeddings: torch.Tensor,
+        edge_distances: torch.Tensor,
+        device: torch.device
+    ) -> Tuple[FoveatedOutput, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Run the foveated module at a given node.
+
+        Returns:
+            foveated_out, cand_edge_emb, cand_mask, cand_indices
+        """
+        e_vis = graph.node_embeddings[node_idx].to(device)
+
+        neighbors = self.graph_builder.get_unvisited_neighbors(
+            graph, node_idx, state.visited_mask
+        )
+
+        if len(neighbors) > 0:
+            cand_edge_emb = edge_embeddings[node_idx][neighbors]
+            cand_mask = torch.ones(len(neighbors), device=device)
+            cand_dist = edge_distances[node_idx][neighbors]
+            cand_indices = neighbors.to(device)
+        else:
+            cand_edge_emb = torch.zeros(0, edge_embeddings.shape[-1], device=device)
+            cand_mask = torch.zeros(0, device=device)
+            cand_dist = torch.zeros(0, device=device)
+            cand_indices = torch.zeros(0, dtype=torch.long, device=device)
+
+        foveated_out = self.foveated(
+            h_content=state.h_content,
+            e_vis_current=e_vis,
+            edge_embeddings=cand_edge_emb,
+            candidate_mask=cand_mask,
+            edge_distances=cand_dist,
+            candidate_indices=cand_indices
+        )
+
+        return foveated_out, cand_edge_emb, cand_mask, cand_indices
+
     # ==============================================================
     # GROUND-TRUTH PARSING
     # ==============================================================
-    
+
     def parse_gt_sequence(
         self, gt_sequence: List[Dict]
     ) -> List[TrainingStep]:
         """
         Parse the ground-truth sequence from the data generator into
         a list of TrainingSteps for teacher-forced training.
-        
+
         Input format (from data/generator.py):
           [{token: '3', node_id: 0, mode: 'READ'},
            {token: '8', node_id: 1, mode: 'READ'},
            {token: '<CHUNK>', node_id: None, mode: 'CHUNK'},
            {token: '1', node_id: 2, mode: 'READ'}, ...]
-        
+
         Output format:
           [TrainingStep(mode='JUMP', node_id=0, digit_label=3, action='READ', target=1),
            TrainingStep(mode='READ', node_id=1, digit_label=8, action='CHUNK', target=None),
            TrainingStep(mode='JUMP', node_id=2, digit_label=1, action='READ', target=3), ...]
         """
         steps = []
-        
-        # Extract only digit tokens (skip <CHUNK> tokens)
-        digit_tokens = [
-            t for t in gt_sequence if t['mode'] == 'READ'
-        ]
-        
-        # Build a mapping: node_id -> position in digit_tokens
-        node_to_pos = {t['node_id']: i for i, t in enumerate(digit_tokens)}
-        
-        # Determine chunk boundaries from the full sequence
-        # A <CHUNK> token between digit i and digit i+1 means they are in different chunks
-        chunk_boundaries = set()  # Set of digit positions where a chunk boundary occurs
+
+        digit_tokens = [t for t in gt_sequence if t['mode'] == 'READ']
+
+        chunk_boundaries = set()
         digit_pos = 0
         for token in gt_sequence:
             if token['mode'] == 'CHUNK':
@@ -215,24 +239,20 @@ class DualModeController(nn.Module):
                     chunk_boundaries.add(digit_pos)
             elif token['mode'] == 'READ':
                 digit_pos += 1
-        
-        # Build training steps
+
         for i, dt in enumerate(digit_tokens):
             node_id = dt['node_id']
             digit_label = int(dt['token'])
-            
-            # Determine if this is a JUMP step (first digit or after a chunk boundary)
+
             is_jump = (i == 0) or (i in chunk_boundaries)
-            
-            # Determine departure action
+
             if i + 1 in chunk_boundaries or i == len(digit_tokens) - 1:
-                # Last digit in chunk or last digit overall
                 action = 'CHUNK'
                 action_target = None
             else:
                 action = 'READ'
                 action_target = digit_tokens[i + 1]['node_id']
-            
+
             steps.append(TrainingStep(
                 mode='JUMP' if is_jump else 'READ',
                 node_id=node_id,
@@ -240,13 +260,13 @@ class DualModeController(nn.Module):
                 action=action,
                 action_target_node=action_target
             ))
-        
+
         return steps
-    
+
     # ==============================================================
     # TRAINING: TEACHER FORCING
     # ==============================================================
-    
+
     def forward_train(
         self,
         graph: SpatialGraph,
@@ -256,54 +276,46 @@ class DualModeController(nn.Module):
     ) -> DualModeOutput:
         """
         Teacher-forced training loop.
-        
+
         Args:
             graph: SpatialGraph with node_embeddings already filled by backbone.
             gt_sequence: Ground-truth sequence from data generator.
             cls_token: [vis_dim] global image feature from backbone GAP.
             device: Torch device.
-        
+
         Returns:
             DualModeOutput with total loss and diagnostics.
         """
         N = graph.num_nodes
-        
-        # Parse ground truth
+
         gt_steps = self.parse_gt_sequence(gt_sequence)
-        
-        # Pre-compute spatial features
+
         features = self._prepare_graph_features(graph)
         node_keys = features['node_keys'].to(device)
         edge_embeddings = features['edge_embeddings'].to(device)
         edge_distances = features['edge_distances'].to(device)
-        
-        # Initialize state
+
         state = ControllerState.initialize(
             num_nodes=N, hidden_dim=self.hidden_dim, device=device
         )
-        
-        # Accumulate losses
+
         total_digit_loss = torch.tensor(0.0, device=device)
         total_action_loss = torch.tensor(0.0, device=device)
         total_jump_loss = torch.tensor(0.0, device=device)
         num_digit_steps = 0
         num_action_steps = 0
         num_jump_steps = 0
-        
-        # Iterate through ground-truth steps
+
         for step_idx, gt_step in enumerate(gt_steps):
-            
+
             if gt_step.mode == 'JUMP':
                 # ============================================
                 # MODE 2: Saccadic Jump
                 # ============================================
-                
-                # Construct query
+
                 if not state.initialized:
-                    # t=0: use CLS + START
                     query = self.saccadic.construct_query_initial(cls_token.to(device))
                 else:
-                    # t>0: use anchor + trajectory
                     anchor_enc = self.spatial_encoder.encode_anchor(
                         state.get_anchor_for_query()
                     )
@@ -311,21 +323,19 @@ class DualModeController(nn.Module):
                         state.get_trajectory_for_query()
                     )
                     query = self.saccadic.construct_query_jump(anchor_enc, traj_enc)
-                
-                # Forward pass
+
                 saccadic_out = self.saccadic(
                     query=query,
                     node_keys=node_keys,
                     visited_mask=state.visited_mask,
                     greedy=True
                 )
-                
-                # Jump loss
+
                 jump_loss = self.saccadic.compute_loss(saccadic_out, gt_step.node_id)
                 total_jump_loss = total_jump_loss + jump_loss
                 num_jump_steps += 1
-                
-                # Update state: jump to the ground-truth node
+
+                # Jump to the ground-truth node
                 node_pos_norm = graph.node_positions_norm[gt_step.node_id].to(device)
                 node_pos_px = graph.node_positions_px[gt_step.node_id].to(device)
                 state.update_after_jump(
@@ -333,113 +343,23 @@ class DualModeController(nn.Module):
                     node_pos_norm=node_pos_norm,
                     node_pos_px=node_pos_px
                 )
-                
-                # Now read the digit at this node (Mode 1 classification)
-                e_vis = graph.node_embeddings[gt_step.node_id].to(device)
-                
-                # Get unvisited neighbors for Mode 1
-                neighbors = self.graph_builder.get_unvisited_neighbors(
-                    graph, gt_step.node_id, state.visited_mask
-                )
-                
-                if len(neighbors) > 0:
-                    # Prepare edge features for candidates
-                    cand_edge_emb = edge_embeddings[gt_step.node_id][neighbors]
-                    cand_mask = torch.ones(len(neighbors), device=device)
-                    cand_dist = edge_distances[gt_step.node_id][neighbors]
-                    cand_indices = neighbors.to(device)
-                else:
-                    cand_edge_emb = torch.zeros(0, edge_embeddings.shape[-1], device=device)
-                    cand_mask = torch.zeros(0, device=device)
-                    cand_dist = torch.zeros(0, device=device)
-                    cand_indices = torch.zeros(0, dtype=torch.long, device=device)
-                
-                # Mode 1 forward (for digit classification only at this step)
-                foveated_out = self.foveated(
-                    h_content=state.h_content,
-                    e_vis_current=e_vis,
-                    edge_embeddings=cand_edge_emb,
-                    candidate_mask=cand_mask,
-                    edge_distances=cand_dist,
-                    candidate_indices=cand_indices
-                )
-                
-                # Digit classification loss
+
+                # MANDATORY READ: classify digit at the jumped-to node
+                foveated_out, cand_edge_emb, cand_mask, cand_indices = \
+                    self._run_foveated_at_node(
+                        graph, gt_step.node_id, state,
+                        edge_embeddings, edge_distances, device
+                    )
+
                 digit_loss = F.cross_entropy(
                     foveated_out.digit_logits.unsqueeze(0),
                     torch.tensor([gt_step.digit_label], device=device)
                 )
                 total_digit_loss = total_digit_loss + digit_loss
                 num_digit_steps += 1
-                
-                # Update h_content (but don't change mode or visited mask again)
+
                 state.h_content = foveated_out.new_h_content
-                
-                # Determine action loss
-                if gt_step.action == 'READ' and gt_step.action_target_node is not None:
-                    # Find the index of the target node in candidates
-                    target_local_idx = (cand_indices == gt_step.action_target_node).nonzero(as_tuple=True)
-                    if len(target_local_idx[0]) > 0:
-                        gt_action_idx = target_local_idx[0][0].item()
-                    else:
-                        gt_action_idx = len(cand_indices)  # <CHUNK> index (fallback)
-                else:
-                    gt_action_idx = len(cand_indices)  # <CHUNK> is the last action
-                
-                # Action loss
-                action_loss = F.cross_entropy(
-                    foveated_out.action_logits.unsqueeze(0),
-                    torch.tensor([gt_action_idx], device=device)
-                )
-                total_action_loss = total_action_loss + action_loss
-                num_action_steps += 1
-                
-                # If action is CHUNK, update state
-                if gt_step.action == 'CHUNK':
-                    state.update_after_chunk()
-            
-            elif gt_step.mode == 'READ':
-                # ============================================
-                # MODE 1: Foveated Read (continuation)
-                # ============================================
-                
-                current_node = state.current_node
-                e_vis = graph.node_embeddings[gt_step.node_id].to(device)
-                
-                # Get unvisited neighbors
-                neighbors = self.graph_builder.get_unvisited_neighbors(
-                    graph, current_node, state.visited_mask
-                )
-                
-                if len(neighbors) > 0:
-                    cand_edge_emb = edge_embeddings[current_node][neighbors]
-                    cand_mask = torch.ones(len(neighbors), device=device)
-                    cand_dist = edge_distances[current_node][neighbors]
-                    cand_indices = neighbors.to(device)
-                else:
-                    cand_edge_emb = torch.zeros(0, edge_embeddings.shape[-1], device=device)
-                    cand_mask = torch.zeros(0, device=device)
-                    cand_dist = torch.zeros(0, device=device)
-                    cand_indices = torch.zeros(0, dtype=torch.long, device=device)
-                
-                # Mode 1 forward
-                foveated_out = self.foveated(
-                    h_content=state.h_content,
-                    e_vis_current=e_vis,
-                    edge_embeddings=cand_edge_emb,
-                    candidate_mask=cand_mask,
-                    edge_distances=cand_dist,
-                    candidate_indices=cand_indices
-                )
-                
-                # Digit classification loss
-                digit_loss = F.cross_entropy(
-                    foveated_out.digit_logits.unsqueeze(0),
-                    torch.tensor([gt_step.digit_label], device=device)
-                )
-                total_digit_loss = total_digit_loss + digit_loss
-                num_digit_steps += 1
-                
+
                 # Determine ground-truth action index
                 if gt_step.action == 'READ' and gt_step.action_target_node is not None:
                     target_local_idx = (cand_indices == gt_step.action_target_node).nonzero(as_tuple=True)
@@ -449,22 +369,58 @@ class DualModeController(nn.Module):
                         gt_action_idx = len(cand_indices)
                 else:
                     gt_action_idx = len(cand_indices)  # <CHUNK>
-                
-                # Action loss
+
                 action_loss = F.cross_entropy(
                     foveated_out.action_logits.unsqueeze(0),
                     torch.tensor([gt_action_idx], device=device)
                 )
                 total_action_loss = total_action_loss + action_loss
                 num_action_steps += 1
-                
-                # Update state based on ground-truth action
+
+                if gt_step.action == 'CHUNK':
+                    state.update_after_chunk()
+
+            elif gt_step.mode == 'READ':
+                # ============================================
+                # MODE 1: Foveated Read (continuation)
+                # ============================================
+
+                current_node = state.current_node
+
+                foveated_out, cand_edge_emb, cand_mask, cand_indices = \
+                    self._run_foveated_at_node(
+                        graph, gt_step.node_id, state,
+                        edge_embeddings, edge_distances, device
+                    )
+
+                digit_loss = F.cross_entropy(
+                    foveated_out.digit_logits.unsqueeze(0),
+                    torch.tensor([gt_step.digit_label], device=device)
+                )
+                total_digit_loss = total_digit_loss + digit_loss
+                num_digit_steps += 1
+
                 if gt_step.action == 'READ' and gt_step.action_target_node is not None:
-                    # Move to the target node
+                    target_local_idx = (cand_indices == gt_step.action_target_node).nonzero(as_tuple=True)
+                    if len(target_local_idx[0]) > 0:
+                        gt_action_idx = target_local_idx[0][0].item()
+                    else:
+                        gt_action_idx = len(cand_indices)
+                else:
+                    gt_action_idx = len(cand_indices)
+
+                action_loss = F.cross_entropy(
+                    foveated_out.action_logits.unsqueeze(0),
+                    torch.tensor([gt_action_idx], device=device)
+                )
+                total_action_loss = total_action_loss + action_loss
+                num_action_steps += 1
+
+                if gt_step.action == 'READ' and gt_step.action_target_node is not None:
                     target_node = gt_step.action_target_node
                     node_pos_norm = graph.node_positions_norm[target_node].to(device)
                     node_pos_px = graph.node_positions_px[target_node].to(device)
-                    
+
                     state.update_after_read(
                         node_idx=target_node,
                         node_pos_norm=node_pos_norm,
@@ -473,21 +429,20 @@ class DualModeController(nn.Module):
                         digit_token=str(gt_step.digit_label)
                     )
                 else:
-                    # CHUNK
                     state.h_content = foveated_out.new_h_content
                     state.update_after_chunk()
-        
+
         # Compute weighted total loss
         avg_digit_loss = total_digit_loss / max(num_digit_steps, 1)
         avg_action_loss = total_action_loss / max(num_action_steps, 1)
         avg_jump_loss = total_jump_loss / max(num_jump_steps, 1)
-        
+
         total_loss = (
             self.loss_weights['digit'] * avg_digit_loss +
             self.loss_weights['action'] * avg_action_loss +
             self.loss_weights['jump'] * avg_jump_loss
         )
-        
+
         return DualModeOutput(
             total_loss=total_loss,
             digit_loss=avg_digit_loss,
@@ -496,14 +451,14 @@ class DualModeController(nn.Module):
             predicted_sequence=state.get_output_sequence(),
             num_steps=state.step,
             num_digits=state.total_digits_read,
-            num_chunks=state.output_tokens.count('<CHUNK>'),
+            num_chunks=sum(1 for t in state.output_tokens if t.get('token') == '<CHUNK>'),
             state=state
         )
-    
+
     # ==============================================================
     # INFERENCE: AUTOREGRESSIVE DECODING
     # ==============================================================
-    
+
     @torch.no_grad()
     def forward_inference(
         self,
@@ -516,45 +471,52 @@ class DualModeController(nn.Module):
     ) -> DualModeOutput:
         """
         Autoregressive decoding loop.
-        
-        Args:
-            graph: SpatialGraph with node_embeddings filled by backbone.
-            cls_token: [vis_dim] global image feature.
-            device: Torch device.
-            max_steps: Maximum number of steps before forced termination.
-            greedy: If True, use argmax. If False, sample.
-            temperature: Sampling temperature.
-        
-        Returns:
-            DualModeOutput with predicted sequence.
+
+        Architecture:
+          Mode 2 (Saccadic Jump):
+            1. Select target node via global attention.
+            2. Jump to target (mark visited, update state).
+            3. MANDATORY READ: classify digit at target, record it.
+            4. Hand off to Mode 1 for action selection.
+
+          Mode 1 (Foveated Read):
+            1. Run foveated on current node → action logits.
+            2. Select action (visit neighbor or CHUNK).
+            3. If READ: move to neighbor, classify its digit, record it.
+            4. If CHUNK: record <CHUNK>, switch to Mode 2.
+
+        This separation ensures:
+          - Every digit is read exactly once.
+          - Isolated nodes (no neighbors) are handled: Mode 2 jumps,
+            reads the digit, Mode 1 sees no neighbors, chunks, Mode 2
+            jumps to the next unvisited node.
+          - No double-CHUNK without a READ in between.
         """
         N = graph.num_nodes
-        
-        # Pre-compute spatial features
+
         features = self._prepare_graph_features(graph)
         node_keys = features['node_keys'].to(device)
         edge_embeddings = features['edge_embeddings'].to(device)
         edge_distances = features['edge_distances'].to(device)
-        
-        # Initialize state
+
         state = ControllerState.initialize(
             num_nodes=N, hidden_dim=self.hidden_dim, device=device
         )
-        
+
         step_count = 0
-        
+
         while not state.terminated and step_count < max_steps:
-            
+
             if state.mode == ControllerMode.SACCADIC_JUMP:
                 # ============================================
                 # MODE 2: Saccadic Jump
                 # ============================================
-                
+
                 # Check if all nodes are visited
                 if state.all_visited():
                     state.terminate()
                     break
-                
+
                 # Construct query
                 if not state.initialized:
                     query = self.saccadic.construct_query_initial(cls_token.to(device))
@@ -566,57 +528,35 @@ class DualModeController(nn.Module):
                         state.get_trajectory_for_query()
                     )
                     query = self.saccadic.construct_query_jump(anchor_enc, traj_enc)
-                
-                # Forward pass
+
+                # Forward pass: select target node
                 saccadic_out = self.saccadic(
                     query=query,
                     node_keys=node_keys,
                     visited_mask=state.visited_mask,
                     greedy=greedy
                 )
-                
+
                 if saccadic_out.selected_node_idx < 0:
                     state.terminate()
                     break
-                
-                # Jump to selected node
+
                 selected = saccadic_out.selected_node_idx
+
+                # Jump to selected node
                 node_pos_norm = graph.node_positions_norm[selected].to(device)
                 node_pos_px = graph.node_positions_px[selected].to(device)
                 state.update_after_jump(selected, node_pos_norm, node_pos_px)
-                
-                # Read the digit at the selected node
-                e_vis = graph.node_embeddings[selected].to(device)
-                
-                # Get neighbors for Mode 1
-                neighbors = self.graph_builder.get_unvisited_neighbors(
-                    graph, selected, state.visited_mask
+
+                # MANDATORY READ: classify digit at the jumped-to node
+                foveated_out, _, _, _ = self._run_foveated_at_node(
+                    graph, selected, state,
+                    edge_embeddings, edge_distances, device
                 )
-                
-                if len(neighbors) > 0:
-                    cand_edge_emb = edge_embeddings[selected][neighbors]
-                    cand_mask = torch.ones(len(neighbors), device=device)
-                    cand_dist = edge_distances[selected][neighbors]
-                    cand_indices = neighbors.to(device)
-                else:
-                    cand_edge_emb = torch.zeros(0, edge_embeddings.shape[-1], device=device)
-                    cand_mask = torch.zeros(0, device=device)
-                    cand_dist = torch.zeros(0, device=device)
-                    cand_indices = torch.zeros(0, dtype=torch.long, device=device)
-                
-                # Classify digit
-                foveated_out = self.foveated(
-                    h_content=state.h_content,
-                    e_vis_current=e_vis,
-                    edge_embeddings=cand_edge_emb,
-                    candidate_mask=cand_mask,
-                    edge_distances=cand_dist,
-                    candidate_indices=cand_indices
-                )
-                
+
                 pred_digit = foveated_out.digit_logits.argmax().item()
                 state.h_content = foveated_out.new_h_content
-                
+
                 # Record the digit
                 state.output_tokens.append({
                     'token': str(pred_digit),
@@ -625,107 +565,87 @@ class DualModeController(nn.Module):
                     'step': state.step,
                     'chunk_size': state.chunk_size
                 })
-                
-                # Select action
-                action_type, node_idx, local_idx = self.foveated.select_action(
-                    foveated_out, greedy=greedy, temperature=temperature
-                )
-                
-                if action_type == 'CHUNK':
-                    state.update_after_chunk()
-                elif action_type == 'READ' and node_idx is not None:
-                    next_pos_norm = graph.node_positions_norm[node_idx].to(device)
-                    next_pos_px = graph.node_positions_px[node_idx].to(device)
-                    state.update_after_read(
-                        node_idx=node_idx,
-                        node_pos_norm=next_pos_norm,
-                        node_pos_px=next_pos_px,
-                        new_h_content=state.h_content,
-                        digit_token=str(pred_digit)
-                    )
-            
+                state.total_digits_read += 1
+
+                # Hand off to Mode 1 for action selection
+                # DO NOT select action here — Mode 1 handles it
+                state.mode = ControllerMode.FOVEATED_READ
+
             elif state.mode == ControllerMode.FOVEATED_READ:
                 # ============================================
-                # MODE 1: Foveated Read
+                # MODE 1: Foveated Read — Action Selection
                 # ============================================
-                
+                # The digit at current_node was already classified and
+                # recorded (by Mode 2 or by the previous Mode 1 READ).
+                # Here we only decide the next action.
+
                 current = state.current_node
-                e_vis = graph.node_embeddings[current].to(device)
-                
-                # Get unvisited neighbors
-                neighbors = self.graph_builder.get_unvisited_neighbors(
-                    graph, current, state.visited_mask
-                )
-                
-                if len(neighbors) > 0:
-                    cand_edge_emb = edge_embeddings[current][neighbors]
-                    cand_mask = torch.ones(len(neighbors), device=device)
-                    cand_dist = edge_distances[current][neighbors]
-                    cand_indices = neighbors.to(device)
-                else:
-                    cand_edge_emb = torch.zeros(0, edge_embeddings.shape[-1], device=device)
-                    cand_mask = torch.zeros(0, device=device)
-                    cand_dist = torch.zeros(0, device=device)
-                    cand_indices = torch.zeros(0, dtype=torch.long, device=device)
-                
-                # Forward pass
-                foveated_out = self.foveated(
-                    h_content=state.h_content,
-                    e_vis_current=e_vis,
-                    edge_embeddings=cand_edge_emb,
-                    candidate_mask=cand_mask,
-                    edge_distances=cand_dist,
-                    candidate_indices=cand_indices
-                )
-                
+
+                # Run foveated for action logits
+                foveated_out, cand_edge_emb, cand_mask, cand_indices = \
+                    self._run_foveated_at_node(
+                        graph, current, state,
+                        edge_embeddings, edge_distances, device
+                    )
+
                 # Select action
                 action_type, node_idx, local_idx = self.foveated.select_action(
                     foveated_out, greedy=greedy, temperature=temperature
                 )
-                
+
                 if action_type == 'CHUNK':
-                    # Check if there are unvisited neighbors for local chunk crossing
-                    if len(neighbors) > 0:
-                        # Local chunk crossing: stay in Mode 1
-                        closest_idx = cand_dist.argmin().item()
-                        closest_node = cand_indices[closest_idx].item()
-                        next_pos_norm = graph.node_positions_norm[closest_node].to(device)
-                        next_pos_px = graph.node_positions_px[closest_node].to(device)
-                        state.update_after_local_chunk(
-                            closest_node, next_pos_norm, next_pos_px
-                        )
-                        # Read the digit at the new chunk start
-                        e_vis_new = graph.node_embeddings[closest_node].to(device)
-                        # (Digit will be classified in the next Mode 1 iteration)
-                    else:
-                        # Structural termination: switch to Mode 2
-                        state.update_after_chunk()
-                
+                    # Record chunk boundary
+                    state.output_tokens.append({
+                        'token': '<CHUNK>',
+                        'node_id': None,
+                        'mode': 'CHUNK',
+                        'step': state.step,
+                        'chunk_size': 0
+                    })
+
+                    # Switch to Mode 2 for next chunk
+                    state.update_after_chunk()
+
                 elif action_type == 'READ' and node_idx is not None:
-                    # Visit the selected neighbor
+                    # Move to the selected neighbor
                     next_pos_norm = graph.node_positions_norm[node_idx].to(device)
                     next_pos_px = graph.node_positions_px[node_idx].to(device)
-                    
-                    # Classify the digit at the neighbor
-                    e_vis_next = graph.node_embeddings[node_idx].to(device)
-                    
-                    # We need to classify the digit at the NEXT node
-                    # But the current foveated_out classified the CURRENT node
-                    # So we just update state and classify in the next iteration
+
                     state.update_after_read(
                         node_idx=node_idx,
                         node_pos_norm=next_pos_norm,
                         node_pos_px=next_pos_px,
                         new_h_content=foveated_out.new_h_content,
-                        digit_token=str(foveated_out.digit_logits.argmax().item())
+                        digit_token=None  # Digit recorded below
                     )
-            
+
+                    # MANDATORY READ: classify digit at the neighbor
+                    foveated_next, _, _, _ = self._run_foveated_at_node(
+                        graph, node_idx, state,
+                        edge_embeddings, edge_distances, device
+                    )
+
+                    pred_digit = foveated_next.digit_logits.argmax().item()
+                    state.h_content = foveated_next.new_h_content
+
+                    # Record the digit
+                    state.output_tokens.append({
+                        'token': str(pred_digit),
+                        'node_id': node_idx,
+                        'mode': 'READ',
+                        'step': state.step,
+                        'chunk_size': state.chunk_size
+                    })
+                    state.total_digits_read += 1
+
+                    # Stay in Mode 1 for next action selection
+
             step_count += 1
-        
+
         # Terminate if max_steps reached
         if not state.terminated:
             state.terminate()
-        
+
         return DualModeOutput(
             total_loss=None,
             digit_loss=None,
@@ -734,7 +654,7 @@ class DualModeController(nn.Module):
             predicted_sequence=state.get_output_sequence(),
             num_steps=state.step,
             num_digits=state.total_digits_read,
-            num_chunks=sum(1 for t in state.output_tokens if t['token'] == '<CHUNK>'),
+            num_chunks=sum(1 for t in state.output_tokens if t.get('token') == '<CHUNK>'),
             state=state
         )
 
@@ -743,8 +663,7 @@ if __name__ == "__main__":
     print("=" * 60)
     print("  DualModeController — Structural Verification")
     print("=" * 60)
-    
-    # Verify module instantiation
+
     controller = DualModeController(
         vis_dim=512,
         hidden_dim=256,
@@ -755,19 +674,18 @@ if __name__ == "__main__":
         T_intra=76.0,
         T_inter=108.0
     )
-    
+
     total_params = sum(p.numel() for p in controller.parameters())
     trainable_params = sum(p.numel() for p in controller.parameters() if p.requires_grad)
-    
+
     print(f"\n  Total parameters:     {total_params:,}")
     print(f"  Trainable parameters: {trainable_params:,}")
-    
-    # Verify sub-module structure
+
     print(f"\n  Sub-modules:")
     for name, module in controller.named_children():
         params = sum(p.numel() for p in module.parameters())
         print(f"    {name}: {params:,} params")
-    
+
     # Verify GT parsing
     gt_seq = [
         {'token': '3', 'node_id': 0, 'mode': 'READ'},
@@ -778,7 +696,7 @@ if __name__ == "__main__":
         {'token': '<CHUNK>', 'node_id': None, 'mode': 'CHUNK'},
         {'token': '5', 'node_id': 4, 'mode': 'READ'},
     ]
-    
+
     steps = controller.parse_gt_sequence(gt_seq)
     print(f"\n  GT Sequence Parsing:")
     print(f"    Input tokens:  {[t['token'] for t in gt_seq]}")
@@ -786,17 +704,16 @@ if __name__ == "__main__":
     for i, s in enumerate(steps):
         print(f"      Step {i}: mode={s.mode}, node={s.node_id}, "
               f"digit={s.digit_label}, action={s.action}, target={s.action_target_node}")
-    
-    # Verify expected parsing
+
     assert steps[0].mode == 'JUMP' and steps[0].node_id == 0
     assert steps[1].mode == 'READ' and steps[1].action == 'CHUNK'
     assert steps[2].mode == 'JUMP' and steps[2].node_id == 2
     assert steps[3].mode == 'READ' and steps[3].action == 'CHUNK'
     assert steps[4].mode == 'JUMP' and steps[4].node_id == 4
-    assert steps[4].action == 'CHUNK'  # Last digit
-    
+    assert steps[4].action == 'CHUNK'
+
     print(f"\n  ✓ GT parsing verified")
-    
+
     print("\n" + "=" * 60)
     print("  All structural checks passed.")
     print("=" * 60)
