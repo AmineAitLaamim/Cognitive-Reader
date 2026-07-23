@@ -480,17 +480,16 @@ class DualModeController(nn.Module):
             4. Hand off to Mode 1 for action selection.
 
           Mode 1 (Foveated Read):
-            1. Run foveated on current node → action logits.
+            1. Run foveated on current node -> action logits.
             2. Select action (visit neighbor or CHUNK).
-            3. If READ: move to neighbor, classify its digit, record it.
-            4. If CHUNK: record <CHUNK>, switch to Mode 2.
+            3. If READ: classify neighbor digit, let update_after_read record it.
+            4. If CHUNK: let update_after_chunk record <CHUNK>, switch to Mode 2.
 
-        This separation ensures:
-          - Every digit is read exactly once.
-          - Isolated nodes (no neighbors) are handled: Mode 2 jumps,
-            reads the digit, Mode 1 sees no neighbors, chunks, Mode 2
-            jumps to the next unvisited node.
-          - No double-CHUNK without a READ in between.
+        Token recording rules:
+          - Mode 2: explicitly appends digit (update_after_jump does NOT record).
+          - Mode 1 READ: passes digit to update_after_read (which records it).
+          - Mode 1 CHUNK: update_after_chunk records <CHUNK>.
+          - No duplicate appends anywhere.
         """
         N = graph.num_nodes
 
@@ -557,7 +556,7 @@ class DualModeController(nn.Module):
                 pred_digit = foveated_out.digit_logits.argmax().item()
                 state.h_content = foveated_out.new_h_content
 
-                # Record the digit
+                # Record the digit (update_after_jump does NOT record digits)
                 state.output_tokens.append({
                     'token': str(pred_digit),
                     'node_id': selected,
@@ -568,7 +567,6 @@ class DualModeController(nn.Module):
                 state.total_digits_read += 1
 
                 # Hand off to Mode 1 for action selection
-                # DO NOT select action here — Mode 1 handles it
                 state.mode = ControllerMode.FOVEATED_READ
 
             elif state.mode == ControllerMode.FOVEATED_READ:
@@ -594,49 +592,28 @@ class DualModeController(nn.Module):
                 )
 
                 if action_type == 'CHUNK':
-                    # Record chunk boundary
-                    state.output_tokens.append({
-                        'token': '<CHUNK>',
-                        'node_id': None,
-                        'mode': 'CHUNK',
-                        'step': state.step,
-                        'chunk_size': 0
-                    })
-
-                    # Switch to Mode 2 for next chunk
+                    # update_after_chunk records <CHUNK> — do NOT append separately
                     state.update_after_chunk()
 
                 elif action_type == 'READ' and node_idx is not None:
-                    # Move to the selected neighbor
-                    next_pos_norm = graph.node_positions_norm[node_idx].to(device)
-                    next_pos_px = graph.node_positions_px[node_idx].to(device)
-
-                    state.update_after_read(
-                        node_idx=node_idx,
-                        node_pos_norm=next_pos_norm,
-                        node_pos_px=next_pos_px,
-                        new_h_content=foveated_out.new_h_content,
-                        digit_token=None  # Digit recorded below
-                    )
-
-                    # MANDATORY READ: classify digit at the neighbor
+                    # Classify neighbor's digit BEFORE moving
                     foveated_next, _, _, _ = self._run_foveated_at_node(
                         graph, node_idx, state,
                         edge_embeddings, edge_distances, device
                     )
-
                     pred_digit = foveated_next.digit_logits.argmax().item()
-                    state.h_content = foveated_next.new_h_content
 
-                    # Record the digit
-                    state.output_tokens.append({
-                        'token': str(pred_digit),
-                        'node_id': node_idx,
-                        'mode': 'READ',
-                        'step': state.step,
-                        'chunk_size': state.chunk_size
-                    })
-                    state.total_digits_read += 1
+                    next_pos_norm = graph.node_positions_norm[node_idx].to(device)
+                    next_pos_px = graph.node_positions_px[node_idx].to(device)
+
+                    # update_after_read records the digit — do NOT append separately
+                    state.update_after_read(
+                        node_idx=node_idx,
+                        node_pos_norm=next_pos_norm,
+                        node_pos_px=next_pos_px,
+                        new_h_content=foveated_next.new_h_content,
+                        digit_token=str(pred_digit)
+                    )
 
                     # Stay in Mode 1 for next action selection
 
