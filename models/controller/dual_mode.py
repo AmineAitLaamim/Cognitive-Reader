@@ -331,11 +331,42 @@ class DualModeController(nn.Module):
                     greedy=True
                 )
 
-                jump_loss = self.saccadic.compute_loss(saccadic_out, gt_step.node_id)
-                total_jump_loss = total_jump_loss + jump_loss
-                num_jump_steps += 1
+                # [FIX-JUMP] The GT jump target (the generator's placement order)
+                # is not identifiable from the image: at t=0 the query is CLS-only
+                # and carries no "which cluster is first" signal, and in general
+                # nothing in the pixels marks the canonical next chunk. Training
+                # the saccadic head against that arbitrary permutation pins its
+                # cross-entropy at the uniform floor ln(K) forever (observed:
+                # jump loss flat ~2.6-2.7 for 13 epochs with full gradient and a
+                # correct visited mask). Instead, supervise the jump HEAD toward
+                # the nearest UNVISITED node that lies outside the current chunk:
+                # a deterministic function of (positions, visited, current) that
+                # the query+keys can in principle learn (it learns greedy-nearest-
+                # chunk, a valid reading order). The TRAJECTORY is still teacher-
+                # forced on gt_step.node_id below, so the digit/action contexts
+                # stay on the real path -- only the jump head's label changes.
+                # t=0 (not state.initialized) has no current position and the
+                # first chunk's identity is arbitrary, so its jump loss is
+                # skipped entirely (order-invariant reading does not need it).
+                if state.initialized:
+                    cur_pos = graph.node_positions_norm[state.current_node]      # [2], graph device
+                    cids = graph.node_chunk_ids                                   # [N], graph device
+                    cur_cid = int(cids[state.current_node].item())
+                    diff = graph.node_positions_norm - cur_pos.unsqueeze(0)       # [N, 2]
+                    d2 = (diff * diff).sum(dim=1)                                 # [N]
+                    valid = (state.visited_mask.cpu() < 0.5) & (cids != cur_cid)  # [N]
+                    n_valid = int(valid.sum().item())
+                    if n_valid > 0:
+                        d2m = d2.clone()
+                        d2m[~valid] = float('inf')
+                        jump_target = int(d2m.argmin().item())
+                    else:
+                        jump_target = gt_step.node_id
+                    jump_loss = self.saccadic.compute_loss(saccadic_out, jump_target)
+                    total_jump_loss = total_jump_loss + jump_loss
+                    num_jump_steps += 1
 
-                # Jump to the ground-truth node
+                # Jump to the ground-truth node (teacher-force the trajectory)
                 node_pos_norm = graph.node_positions_norm[gt_step.node_id].to(device)
                 node_pos_px = graph.node_positions_px[gt_step.node_id].to(device)
                 state.update_after_jump(
@@ -360,7 +391,15 @@ class DualModeController(nn.Module):
 
                 state.h_content = foveated_out.new_h_content
 
-                # Determine ground-truth action index
+                # Determine ground-truth action index.
+                # NOTE (action convention): gt_action_idx = len(cand_indices) is the
+                # CHUNK slot, i.e. action_logits layout MUST be
+                # [cand_0 .. cand_{n-1}, CHUNK]. This must match
+                # FoveatedReadModule.forward (how action_logits is stacked) and
+                # FoveatedReadModule.select_action (how a local index decodes to a
+                # node vs CHUNK). If the action loss stays flat after retrain, the
+                # mismatch lives in foveated.py (flip the CHUNK slot there), NOT
+                # here -- do not change this convention blindly.
                 if gt_step.action == 'READ' and gt_step.action_target_node is not None:
                     target_local_idx = (cand_indices == gt_step.action_target_node).nonzero(as_tuple=True)
                     if len(target_local_idx[0]) > 0:
@@ -400,6 +439,8 @@ class DualModeController(nn.Module):
                 total_digit_loss = total_digit_loss + digit_loss
                 num_digit_steps += 1
 
+                # NOTE (action convention): same CHUNK-last layout as the JUMP
+                # branch above; see the comment there. Must match foveated.py.
                 if gt_step.action == 'READ' and gt_step.action_target_node is not None:
                     target_local_idx = (cand_indices == gt_step.action_target_node).nonzero(as_tuple=True)
                     if len(target_local_idx[0]) > 0:

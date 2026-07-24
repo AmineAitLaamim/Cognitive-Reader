@@ -13,6 +13,13 @@ DUAL-PATHWAY INVARIANT:
   The classifier sees ONLY [e_vis || h_content]. It NEVER sees coordinates.
   The router sees ONLY edge features and h_content. It NEVER sees e_vis.
   These two pathways share h_content but nothing else.
+
+[FIX-CHUNK] The <CHUNK> logit is now conditioned on SET-LEVEL statistics of the
+candidate set (d_min_norm, k_valid_norm, mean_d_norm) in addition to the closest
+candidate's edge embedding. Previously it saw only the single closest candidate,
+which made "should READ" and "should CHUNK" indistinguishable (within a chunk the
+nearest candidate is always an unvisited same-chunk node at ~0.56*r in both
+cases), pinning the action loss near uniform.
 """
 
 import torch
@@ -127,11 +134,18 @@ class FoveatedReadModule(nn.Module):
             nn.Linear(hidden_dim // 2, 1)
         )
         
-        # CHUNK logit: (h_content || e_closest || d_min_norm) -> scalar
-        # e_closest: edge embedding of the nearest candidate
-        # d_min_norm: normalized minimum distance (the critical proximity signal)
+        # CHUNK logit: (h_content || e_closest || d_min_norm || k_valid_norm || mean_d_norm) -> scalar
+        # e_closest:    edge embedding of the nearest candidate
+        # d_min_norm:   normalized minimum distance to any valid candidate
+        # k_valid_norm: fraction of candidates that are valid (set-level) [FIX-CHUNK]
+        # mean_d_norm:  mean distance over valid candidates (set-level)   [FIX-CHUNK]
+        # [FIX-CHUNK] The set-level scalars let the CHUNK decision distinguish
+        # "mid-chunk" (several close candidates) from "chunk exhausted"
+        # (few / far candidates), which the single closest candidate alone
+        # could not -- within a chunk the nearest candidate is always an
+        # unvisited same-chunk node at ~0.56*r in both cases.
         self.chunk_mlp = nn.Sequential(
-            nn.Linear(hidden_dim + edge_dim + 1, hidden_dim),
+            nn.Linear(hidden_dim + edge_dim + 3, hidden_dim),   # +3 set-level scalars [FIX-CHUNK]
             nn.LayerNorm(hidden_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
@@ -215,12 +229,21 @@ class FoveatedReadModule(nn.Module):
             d_min = valid_distances.min()
             d_min_norm = (d_min / self.radius).unsqueeze(0)  # [1]
             
+            # [FIX-CHUNK] Set-level statistics over valid candidates, so the
+            # CHUNK decision can distinguish "mid-chunk" (several close
+            # candidates) from "chunk exhausted" (few / far candidates).
+            k_valid = candidate_mask.sum()                              # scalar
+            k_valid_norm = (k_valid / max(K, 1)).unsqueeze(0)           # [1]
+            masked_d = edge_distances * candidate_mask
+            mean_d = masked_d.sum() / k_valid.clamp(min=1.0)
+            mean_d_norm = (mean_d / self.radius).unsqueeze(0)           # [1]
+            
             # Get edge embedding of the closest valid candidate
             closest_idx = valid_distances.argmin()
             e_closest = edge_embeddings[closest_idx]  # [edge_dim]
             
-            # Compute CHUNK logit
-            chunk_input = torch.cat([new_h_content, e_closest, d_min_norm], dim=-1)
+            # Compute CHUNK logit (now conditioned on set-level stats)
+            chunk_input = torch.cat([new_h_content, e_closest, d_min_norm, k_valid_norm, mean_d_norm], dim=-1)
             chunk_logit = self.chunk_mlp(chunk_input)  # [1]
             
             # --- Combine into action logits ---
