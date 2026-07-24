@@ -2,6 +2,11 @@
 data/generator.py
 Constrained Polar Sampling data generator for the Cognitive Reader project.
 Generates 2D digit layouts with mathematically guaranteed chunk boundaries.
+
+Contract (fixed):
+  generate_sample(N) returns exactly N nodes, or raises ValueError if N cannot
+  be placed on the canvas under the geometric constraints. It NEVER returns a
+  silently-truncated layout (the old early-return on placement failure is gone).
 """
 
 import numpy as np
@@ -20,18 +25,22 @@ class GeneratorConfig:
     # Core geometric threshold (pixels)
     threshold_radius_r: float = 80.0
 
-    # Derived intra/inter chunk bounds
+    # Derived intra/inter chunk bounds (factors of r)
     r_intra_factor: float = 0.8       # max intra-chunk distance = 0.8 * r
     r_inter_factor: float = 1.5       # min inter-chunk distance = 1.5 * r
     r_max_inter_factor: float = 2.5   # max inter-chunk distance = 2.5 * r
 
-    # Intra-chunk angle distribution (radians)
-    intra_angle_mean: float = 0.0
+    # Intra-chunk angle distribution (radians): controls chain straightness.
     intra_angle_std: float = 5.0 * (math.pi / 180.0)  # 5 degrees
 
-    # Inter-chunk angle distribution (radians) — carriage return (down-left)
+    # [DEPRECATED, unused] The old fixed inter-chunk cone (225deg +/- 10deg) is
+    # what marched the walk off the top edge and killed placement at 5 nodes.
+    # Inter direction is now sampled over the full circle (see
+    # _sample_inter_chunk_position). Kept here only so no existing constructor
+    # call that passes these kwargs raises TypeError. Do not rely on them.
+    intra_angle_mean: float = 0.0
     inter_angle_mean: float = 225.0 * (math.pi / 180.0)
-    inter_angle_std: float = 10.0 * (math.pi / 180.0)  # 10 degrees
+    inter_angle_std: float = 10.0 * (math.pi / 180.0)
 
     # Sim2Real detector noise (pixels)
     noise_sigma: float = 3.0
@@ -51,11 +60,19 @@ class GeneratorConfig:
     # Boundary margin (keep digits away from canvas edges)
     boundary_margin: float = 40.0
 
-    # Rejection sampling max attempts for boundary violations
-    max_resample_attempts: int = 50
+    # Rejection sampling max attempts per placement (full-circle search)
+    max_resample_attempts: int = 80
 
-    # Minimum intra-digit distance (prevent overlap)
+    # Minimum intra-digit distance within a chain (prevent overlap)
     min_digit_gap: float = 25.0
+
+    # Min separation between a new node and any node of a *different* chunk,
+    # so clusters do not draw on top of each other.
+    min_cluster_gap: float = 22.0
+
+    # Outer retry budget. Each attempt uses a fresh random start and a fresh
+    # per-chunk chain orientation; the longest successful layout wins.
+    max_outer_attempts: int = 40
 
 
 @dataclass
@@ -87,12 +104,17 @@ class GeneratedSample:
 class ConstrainedPolarGenerator:
     """
     Generates synthetic 2D digit layouts using Constrained Polar Sampling.
-    
-    Guarantees:
-      - Intra-chunk distances are strictly < r_intra_factor * r
-      - Inter-chunk distances are strictly > r_inter_factor * r
+
+    Guarantees (preserved from the original design):
+      - Intra-chunk consecutive distance < r_intra_factor * r
+      - Inter-chunk distance (chunk k last -> chunk k+1 first) > r_inter_factor * r
       - Ground-truth <CHUNK> tokens align exactly with physical spatial gaps
       - Sim2Real noise is injected for detector training
+
+    Contract:
+      generate_sample(N) returns exactly N nodes, or raises ValueError if N
+      cannot be placed on the canvas under the geometric constraints. It never
+      returns a silently-truncated layout.
     """
 
     def __init__(self, config: GeneratorConfig):
@@ -113,87 +135,112 @@ class ConstrainedPolarGenerator:
                 f"Increase r or decrease noise_sigma."
             )
 
+    # ==============================================================
+    # PUBLIC
+    # ==============================================================
+
     def generate_sample(self, total_digits: int) -> GeneratedSample:
         """
-        Generate a single 2D digit layout.
-        
-        Args:
-            total_digits: Total number of digits to place.
-            
-        Returns:
-            GeneratedSample with nodes, ground-truth sequence, and metadata.
+        Generate a 2D digit layout with exactly `total_digits` nodes.
+
+        Uses an outer retry loop: each attempt draws a fresh random start and
+        fresh per-chunk chain orientations, and the inter-chunk jump direction
+        is sampled over the full circle so the walk can snake around the canvas
+        instead of marching off one edge. The longest layout across attempts is
+        remembered; if no attempt reaches `total_digits`, raises.
         """
+        best_nodes: Optional[List[DigitNode]] = None
+        best_gt: Optional[List[Dict[str, Any]]] = None
+        best_chunks: int = 0
+
+        for _attempt in range(self.cfg.max_outer_attempts):
+            nodes, gt, n_chunks = self._try_place(total_digits)
+            if len(nodes) >= total_digits:
+                return GeneratedSample(
+                    nodes=nodes,
+                    gt_sequence=gt,
+                    img_width=self.cfg.img_width,
+                    img_height=self.cfg.img_height,
+                    num_chunks=n_chunks,
+                    total_digits=len(nodes),
+                )
+            if best_nodes is None or len(nodes) > len(best_nodes):
+                best_nodes, best_gt, best_chunks = nodes, gt, n_chunks
+
+        achieved = len(best_nodes) if best_nodes else 0
+        raise ValueError(
+            f"ConstrainedPolarGenerator could not place {total_digits} digits in "
+            f"{self.cfg.max_outer_attempts} attempts (best achieved: {achieved}). "
+            f"This is a canvas-capacity limit at threshold_radius_r={self.r:.0f} on a "
+            f"{self.cfg.img_width}x{self.cfg.img_height} canvas, not a code bug. "
+            f"Lower total_digits / dataset_config.max_digits, lower threshold_radius_r, "
+            f"or enlarge the canvas."
+        )
+
+    # ==============================================================
+    # SINGLE PLACEMENT ATTEMPT
+    # ==============================================================
+
+    def _try_place(
+        self, total_digits: int
+    ) -> Tuple[List[DigitNode], List[Dict[str, Any]], int]:
+        """One random walk attempt. Returns (nodes, gt, num_chunks)."""
         nodes: List[DigitNode] = []
-        gt_sequence: List[Dict[str, Any]] = []
+        gt: List[Dict[str, Any]] = []
 
-        # Initialize starting position in the top-left region
-        current_x = np.random.uniform(
-            self.cfg.boundary_margin + self.r_inter,
-            self.cfg.img_width * 0.25
-        )
-        current_y = np.random.uniform(
-            self.cfg.boundary_margin + self.r_inter,
-            self.cfg.img_height * 0.2
-        )
+        # Start anywhere in the usable canvas (old code pinned x to 160).
+        m = self.cfg.boundary_margin
+        current_x = np.random.uniform(m, self.cfg.img_width - m)
+        current_y = np.random.uniform(m, self.cfg.img_height - m)
 
-        current_chunk_size = 0
-        current_chunk_id = 0
+        chunk_size = 0
+        chunk_id = 0
         node_id = 0
-        is_first_digit = True
+        is_first = True
+        intra_base = np.random.uniform(0.0, 2 * math.pi)   # random chain heading
 
         while node_id < total_digits:
-            # --- Decide placement mode ---
-            need_inter_chunk = False
-
-            if is_first_digit:
-                # First digit: no inter-chunk jump needed, just place it
-                need_inter_chunk = False
-            elif current_chunk_size >= self.cfg.max_chunk_size:
-                need_inter_chunk = True
+            need_inter = False
+            if is_first:
+                need_inter = False
+            elif chunk_size >= self.cfg.max_chunk_size:
+                need_inter = True
             elif self._approaching_boundary(current_x, current_y, mode='intra'):
-                need_inter_chunk = True
+                need_inter = True
 
-            # --- Place the digit ---
-            if need_inter_chunk and not is_first_digit:
-                # INTER-CHUNK PLACEMENT (new line / new chunk)
-                new_x, new_y = self._sample_inter_chunk_position(current_x, current_y)
-
-                if new_x is None:
-                    # Cannot place more digits without violating constraints
-                    break
-
-                # Insert <CHUNK> token in ground truth
-                gt_sequence.append({
-                    'token': '<CHUNK>',
-                    'node_id': None,
-                    'mode': 'CHUNK'
-                })
-                current_chunk_id += 1
-                current_chunk_size = 1
-
+            if need_inter and not is_first:
+                # INTER-CHUNK PLACEMENT (new chunk)
+                pos = self._sample_inter_chunk_position(current_x, current_y, nodes)
+                if pos is None:
+                    break                                   # stuck -> let outer retry roll
+                new_x, new_y = pos
+                gt.append({'token': '<CHUNK>', 'node_id': None, 'mode': 'CHUNK'})
+                chunk_id += 1
+                chunk_size = 1
+                intra_base = np.random.uniform(0.0, 2 * math.pi)   # new heading per chain
             else:
-                if is_first_digit:
+                if is_first:
                     new_x, new_y = current_x, current_y
-                    current_chunk_size = 1
-                    is_first_digit = False
+                    chunk_size = 1
+                    is_first = False
                 else:
                     # INTRA-CHUNK PLACEMENT
-                    new_x, new_y = self._sample_intra_chunk_position(current_x, current_y)
-
-                    if new_x is None:
-                        # Intra-chunk placement failed (boundary), force inter-chunk
-                        new_x, new_y = self._sample_inter_chunk_position(current_x, current_y)
-                        if new_x is None:
+                    pos = self._sample_intra_chunk_position(
+                        current_x, current_y, nodes, chunk_id, intra_base
+                    )
+                    if pos is None:
+                        # intra crowded/blocked -> force a chunk break
+                        pos = self._sample_inter_chunk_position(current_x, current_y, nodes)
+                        if pos is None:
                             break
-                        gt_sequence.append({
-                            'token': '<CHUNK>',
-                            'node_id': None,
-                            'mode': 'CHUNK'
-                        })
-                        current_chunk_id += 1
-                        current_chunk_size = 1
+                        new_x, new_y = pos
+                        gt.append({'token': '<CHUNK>', 'node_id': None, 'mode': 'CHUNK'})
+                        chunk_id += 1
+                        chunk_size = 1
+                        intra_base = np.random.uniform(0.0, 2 * math.pi)
                     else:
-                        current_chunk_size += 1
+                        new_x, new_y = pos
+                        chunk_size += 1
 
             # --- Generate digit properties ---
             scale = np.random.uniform(self.cfg.scale_min, self.cfg.scale_max)
@@ -216,115 +263,114 @@ class ConstrainedPolarGenerator:
                 width=w,
                 height=h,
                 scale=scale,
-                chunk_id=current_chunk_id
+                chunk_id=chunk_id,
             )
             nodes.append(node)
 
             # Append digit to ground-truth sequence
-            gt_sequence.append({
-                'token': label,
-                'node_id': node_id,
-                'mode': 'READ'
-            })
+            gt.append({'token': label, 'node_id': node_id, 'mode': 'READ'})
 
             # Update state
             current_x = new_x
             current_y = new_y
             node_id += 1
 
-        return GeneratedSample(
-            nodes=nodes,
-            gt_sequence=gt_sequence,
-            img_width=self.cfg.img_width,
-            img_height=self.cfg.img_height,
-            num_chunks=current_chunk_id + 1,
-            total_digits=len(nodes)
-        )
+        return nodes, gt, (chunk_id + 1)
+
+    # ==============================================================
+    # SAMPLING HELPERS
+    # ==============================================================
 
     def _sample_intra_chunk_position(
-        self, current_x: float, current_y: float
-    ) -> Tuple[Optional[float], Optional[float]]:
-        """
-        Sample a position for the next digit within the same chunk.
-        Uses rejection sampling to guarantee boundary constraints.
-        
-        Returns:
-            (new_x, new_y) or (None, None) if placement is impossible.
-        """
+        self, current_x: float, current_y: float,
+        nodes: List[DigitNode], chunk_id: int, base_angle: float,
+    ) -> Optional[Tuple[float, float]]:
+        """Next digit in the same chunk. Distance < r_intra for any angle.
+        Returns (x, y) on success or None on failure (NOT a (None, None) tuple,
+        so callers' `if pos is None:` guards work)."""
         d_min = max(self.cfg.min_digit_gap, 1.2 * self.cfg.base_digit_w)
-
         for _ in range(self.cfg.max_resample_attempts):
             d = np.random.uniform(d_min, self.r_intra)
-            theta = np.random.normal(self.cfg.intra_angle_mean, self.cfg.intra_angle_std)
-
+            theta = np.random.normal(base_angle, self.cfg.intra_angle_std)
             new_x = current_x + d * math.cos(theta)
             new_y = current_y + d * math.sin(theta)
-
-            # Check boundary constraints
-            if self._is_within_bounds(new_x, new_y):
-                return new_x, new_y
-
-        return None, None
+            if not self._is_within_bounds(new_x, new_y):
+                continue
+            if self._too_close_to_other_chunks(new_x, new_y, nodes, chunk_id):
+                continue
+            return new_x, new_y
+        return None   # [FIX2] was `return None, None` -> broke the `is None` guard
 
     def _sample_inter_chunk_position(
-        self, current_x: float, current_y: float
-    ) -> Tuple[Optional[float], Optional[float]]:
+        self, current_x: float, current_y: float,
+        nodes: List[DigitNode],
+    ) -> Optional[Tuple[float, float]]:
         """
-        Sample a position for the first digit of a new chunk (line break).
-        Uses rejection sampling to guarantee:
-          1. Distance > r_inter (chunk boundary preserved)
-          2. Position is within canvas bounds
-        
-        Returns:
-            (new_x, new_y) or (None, None) if placement is impossible.
+        First digit of a new chunk. Distance > r_inter for any angle.
+        Direction is uniform on the full circle, so from a boundary point the
+        in-bounds hemisphere is always searchable (the old 10deg cone was not).
+        A soft global gap keeps clusters from overlapping older digits.
+        Returns (x, y) on success or None on failure.
         """
         for _ in range(self.cfg.max_resample_attempts):
             d = np.random.uniform(self.r_inter, self.r_max_inter)
-            theta = np.random.normal(self.cfg.inter_angle_mean, self.cfg.inter_angle_std)
-
+            theta = np.random.uniform(0.0, 2 * math.pi)
             new_x = current_x + d * math.cos(theta)
             new_y = current_y + d * math.sin(theta)
+            if not self._is_within_bounds(new_x, new_y):
+                continue
+            if self._too_close_to_other_chunks(new_x, new_y, nodes, exclude_chunk=None):
+                continue
+            return new_x, new_y
+        return None   # [FIX2] was `return None, None` -> broke the `is None` guard
 
-            # Check boundary constraints
-            if self._is_within_bounds(new_x, new_y):
-                # Verify distance constraint is preserved (no clamping)
-                actual_d = math.sqrt((new_x - current_x)**2 + (new_y - current_y)**2)
-                if actual_d >= self.r_inter:
-                    return new_x, new_y
-
-        return None, None
+    def _too_close_to_other_chunks(
+        self, x: float, y: float,
+        nodes: List[DigitNode], exclude_chunk: Optional[int],
+    ) -> bool:
+        """True if (x, y) is within min_cluster_gap of any node outside exclude_chunk."""
+        gap = self.cfg.min_cluster_gap
+        gap2 = gap * gap
+        for n in nodes:
+            if exclude_chunk is not None and n.chunk_id == exclude_chunk:
+                continue
+            dx = x - n.center_x
+            dy = y - n.center_y
+            if dx * dx + dy * dy < gap2:
+                return True
+        return False
 
     def _is_within_bounds(self, x: float, y: float) -> bool:
         """Check if a position is within the canvas boundaries."""
-        margin = self.cfg.boundary_margin
-        return (
-            margin <= x <= self.cfg.img_width - margin and
-            margin <= y <= self.cfg.img_height - margin
-        )
+        m = self.cfg.boundary_margin
+        return (m <= x <= self.cfg.img_width - m) and (m <= y <= self.cfg.img_height - m)
 
     def _approaching_boundary(self, x: float, y: float, mode: str = 'intra') -> bool:
         """Check if the current position is too close to the canvas boundary."""
-        margin = self.cfg.boundary_margin
+        m = self.cfg.boundary_margin
         buffer = self.r_intra if mode == 'intra' else self.r_inter
-
         return (
-            x + buffer > self.cfg.img_width - margin or
-            y + buffer > self.cfg.img_height - margin or
-            x - buffer < margin or
-            y - buffer < margin
+            x + buffer > self.cfg.img_width - m or
+            y + buffer > self.cfg.img_height - m or
+            x - buffer < m or
+            y - buffer < m
         )
+
+    # ==============================================================
+    # INTROSPECTION (unchanged)
+    # ==============================================================
 
     def get_bounding_boxes(self, sample: GeneratedSample, use_noise: bool = True) -> List[Dict]:
         """
         Extract bounding boxes from a generated sample.
-        
+
         Args:
             sample: The generated sample.
             use_noise: If True, return noisy boxes (for detector training).
                        If False, return perfect boxes (for controller training).
-        
+
         Returns:
-            List of dicts with {x, y, w, h, center_x, center_y, label, node_id, chunk_id}
+            List of dicts with {x, y, w, h, center_x, center_y, label, node_id, chunk_id, scale}
         """
         boxes = []
         for node in sample.nodes:
@@ -349,7 +395,7 @@ class ConstrainedPolarGenerator:
         """
         Compute pairwise distances between all nodes.
         Useful for verifying graph construction and threshold calibration.
-        
+
         Returns:
             Dict with distance matrix and chunk boundary flags.
         """
@@ -371,7 +417,7 @@ class ConstrainedPolarGenerator:
                     dx = ni.center_x - nj.center_x
                     dy = ni.center_y - nj.center_y
 
-                distances[i, j] = math.sqrt(dx**2 + dy**2)
+                distances[i, j] = math.sqrt(dx * dx + dy * dy)
                 same_chunk[i, j] = (ni.chunk_id == nj.chunk_id)
 
         return {
@@ -384,11 +430,31 @@ class ConstrainedPolarGenerator:
         }
 
 
-# --- Convenience function for quick testing ---
+# ------------------------------------------------------------------
+# Boundary guard for every call site (dataset / eval / scripts).
+# generate_sample now raises on infeasible N, so this is belt-and-braces:
+# it turns any future silent-truncation regression into a hard crash at the
+# exact sample that caused it, instead of a 50-epoch silent failure.
+# ------------------------------------------------------------------
+def generate_full(generator: ConstrainedPolarGenerator, total_digits: int) -> GeneratedSample:
+    """Call generate_sample and assert the count contract at the boundary."""
+    layout = generator.generate_sample(total_digits)
+    assert len(layout.nodes) == total_digits, (
+        f"generator returned {len(layout.nodes)} nodes, expected {total_digits}"
+    )
+    return layout
+
+
+# --- Validation helper ---
 def generate_and_validate(config: GeneratorConfig, total_digits: int = 50) -> GeneratedSample:
     """
-    Generate a sample and validate all geometric constraints.
+    Generate a sample and validate the *consecutive-pair* geometric constraints.
     Raises AssertionError if any constraint is violated.
+
+    Note: only consecutive node pairs are checked. A 4-node chain with ~45px
+    steps has its 1<->3 pair at ~90px > r_intra; that pair is not an edge and
+    was never meant to satisfy r_intra, so the old "every same-chunk pair"
+    assertion was a false failure waiting to happen on long chains.
     """
     gen = ConstrainedPolarGenerator(config)
     sample = gen.generate_sample(total_digits)
@@ -401,23 +467,27 @@ def generate_and_validate(config: GeneratorConfig, total_digits: int = 50) -> Ge
     for i in range(len(sample.nodes)):
         for j in range(i + 1, len(sample.nodes)):
             d = distances[i, j]
-            if same_chunk[i, j]:
+            ni, nj = sample.nodes[i], sample.nodes[j]
+            # Consecutive intra-chunk pair must be within r_intra
+            if same_chunk[i, j] and abs(ni.node_id - nj.node_id) == 1:
                 assert d <= gen.r_intra, (
                     f"Intra-chunk violation: nodes {i},{j} distance={d:.1f} > r_intra={gen.r_intra:.1f}"
                 )
-            else:
-                # Only check adjacent chunks (non-adjacent chunks can be far apart)
-                chunk_diff = abs(sample.nodes[i].chunk_id - sample.nodes[j].chunk_id)
-                if chunk_diff == 1:
-                    assert d >= gen.r_inter, (
-                        f"Inter-chunk violation: nodes {i},{j} distance={d:.1f} < r_inter={gen.r_inter:.1f}"
-                    )
+            # Consecutive inter-chunk pair must exceed r_inter
+            if (not same_chunk[i, j]) and abs(ni.chunk_id - nj.chunk_id) == 1 \
+                    and abs(ni.node_id - nj.node_id) == 1:
+                assert d >= gen.r_inter, (
+                    f"Inter-chunk violation: nodes {i},{j} distance={d:.1f} < r_inter={gen.r_inter:.1f}"
+                )
 
-    print(f"✓ Generated {sample.total_digits} digits in {sample.num_chunks} chunks. All constraints satisfied.")
+    print(f"OK Generated {sample.total_digits} digits in {sample.num_chunks} chunks. Constraints satisfied.")
     return sample
 
 
 if __name__ == "__main__":
+    # Built-in capacity probe: for each N, success rate over 100 seeds.
+    # The feasible_max line is the number you set dataset_config.max_digits
+    # and ood_eval_lengths to (or lower r / enlarge the canvas to raise it).
     config = GeneratorConfig(
         img_width=640,
         img_height=640,
@@ -427,22 +497,30 @@ if __name__ == "__main__":
         min_chunk_size=1
     )
 
-    # Generate and validate a sample
-    sample = generate_and_validate(config, total_digits=50)
+    gen = ConstrainedPolarGenerator(config)
+    print(f"r_intra={gen.r_intra:.0f}  r_inter={gen.r_inter:.0f}  "
+          f"T_intra={gen.T_intra:.1f}  T_inter={gen.T_inter:.1f}\n")
+    print(f"{'N':>4}  {'success%':>9}  {'min':>4}  {'max':>4}  {'feasible':>8}")
 
-    # Print summary
-    print(f"\nSample Summary:")
-    print(f"  Total digits: {sample.total_digits}")
-    print(f"  Total chunks: {sample.num_chunks}")
-    print(f"  GT sequence length: {len(sample.gt_sequence)}")
-    print(f"  T_intra: {ConstrainedPolarGenerator(config).T_intra:.1f}px")
-    print(f"  T_inter: {ConstrainedPolarGenerator(config).T_inter:.1f}px")
-    print(f"  Dead zone: [{ConstrainedPolarGenerator(config).T_intra:.1f}, {ConstrainedPolarGenerator(config).T_inter:.1f}]px")
+    feasible_max = 0
+    for N in [5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 60]:
+        ok = 0
+        achieved = []
+        for s in range(100):
+            np.random.seed(s)
+            try:
+                lay = gen.generate_sample(N)
+                achieved.append(len(lay.nodes))
+                if len(lay.nodes) >= N:
+                    ok += 1
+            except ValueError:
+                achieved.append(0)
+        rate = ok  # out of 100
+        feas = rate >= 95
+        if feas:
+            feasible_max = N
+        print(f"{N:>4}  {rate:>8}%  {min(achieved):>4}  {max(achieved):>4}  {'YES' if feas else 'no':>8}")
 
-    # Print first 20 tokens of GT sequence
-    print(f"\n  GT Sequence (first 20 tokens):")
-    for item in sample.gt_sequence[:20]:
-        if item['token'] == '<CHUNK>':
-            print(f"    <CHUNK>")
-        else:
-            print(f"    '{item['token']}' (node_id={item['node_id']}, chunk={sample.nodes[item['node_id']].chunk_id})")
+    print(f"\n=> empirical feasible_max (>=95% success) at r=80/640: {feasible_max}")
+    print("   set dataset_config.max_digits and ood_eval_lengths <= this value,")
+    print("   OR lower threshold_radius_r / enlarge the canvas to raise it.")

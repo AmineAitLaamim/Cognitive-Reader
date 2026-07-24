@@ -1,0 +1,83 @@
+{
+  "digits": 20,
+  "seed": 42,
+  "gt": "4542<CHUNK>1",
+  "pred": "452<CHUNK>1<CHUNK>4<CHUNK>",
+  "accuracy": {
+    "length_gt": 5,
+    "length_pred": 5,
+    "positional_correct": 2,
+    "positional_total": 5,
+    "positional_accuracy": 0.4,
+    "edit_distance": 2,
+    "edit_distance_accuracy": 0.6
+  },
+  "nodes_visited": 5,
+  "nodes_total": 5,
+  "elapsed_ms": 872.3721504211426,
+  "tokens": [
+    {
+      "token": "4",
+      "node_id": 0,
+      "mode": "READ",
+      "step": 0,
+      "chunk_size": 1
+    },
+    {
+      "token": "5",
+      "node_id": 1,
+      "mode": "READ",
+      "step": 1,
+      "chunk_size": 2
+    },
+    {
+      "token": "2",
+      "node_id": 3,
+      "mode": "READ",
+      "step": 2,
+      "chunk_size": 3
+    },
+    {
+      "token": "<CHUNK>",
+      "node_id": null,
+      "mode": "CHUNK",
+      "step": 3,
+      "chunk_size": 0
+    },
+    {
+      "token": "1",
+      "node_id": 4,
+      "mode": "READ",
+      "step": 3,
+      "chunk_size": 1
+    },
+    {
+      "token": "<CHUNK>",
+      "node_id": null,
+      "mode": "CHUNK",
+      "step": 4,
+      "chunk_size": 0
+    },
+    {
+      "token": "4",
+      "node_id": 2,
+      "mode": "READ",
+      "step": 4,
+      "chunk_size": 1
+    },
+    {
+      "token": "<CHUNK>",
+      "node_id": null,
+      "mode": "CHUNK",
+      "step": 5,
+      "chunk_size": 0
+    },
+    {
+      "token": "<END>",
+      "node_id": null,
+      "mode": "END",
+      "step": 5,
+      "chunk_size": 0
+    }
+  ]
+}
