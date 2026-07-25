@@ -13,12 +13,27 @@ Components:
 All functions are standalone: they take tensors as input,
 not model objects. This keeps the loss module decoupled from
 the model architecture.
+
+[CHANGES]
+  - Added top-level `import numpy as np` (was only in __main__;
+    LossMonitor.get_stats() uses np.array and would NameError
+    if called from outside).
+  - heatmap_focal_loss now forces float32 via autocast(enabled=False)
+    + .float() casts, matching the fix in models/detector/heatmap.py.
+    Under fp16, sigmoid saturates to 1.0 and the clamp to (1-1e-4)
+    is ineffective (0.9999 rounds to 1.0 in fp16), causing
+    log(1-pred) = log(0) = -inf -> nan. Forcing fp32 fixes this.
+    NOTE: This is a duplicate of the function in models/detector/heatmap.py.
+    The trainer uses the heatmap.py version (via HeatmapHead.focal_loss).
+    This copy is kept for backward compatibility with any code that
+    imports from train.losses directly. Keep both in sync.
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+import numpy as np
 from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass, field
 
@@ -226,6 +241,17 @@ def heatmap_focal_loss(
     Handles the extreme foreground/background imbalance (99.5% background)
     by down-weighting easy negatives near digit centers.
     
+    [FP32 FIX] The entire computation is forced to float32 via
+    autocast(enabled=False) + explicit .float() casts. Under fp16,
+    sigmoid saturates to exactly 1.0 and the clamp to (1-1e-4) is
+    ineffective because 0.9999 rounds to 1.0 in fp16, causing
+    log(1-pred) = log(0) = -inf -> nan. Forcing fp32 makes the
+    clamp work and eliminates the nan.
+    
+    NOTE: This is a duplicate of the function in models/detector/heatmap.py.
+    The trainer uses the heatmap.py version (via HeatmapHead.focal_loss).
+    This copy is kept for backward compatibility. Keep both in sync.
+    
     Args:
         pred: [B, 1, H, W] — raw logits (before sigmoid).
         target: [B, 1, H, W] — ground-truth Gaussian heatmap [0, 1].
@@ -235,26 +261,30 @@ def heatmap_focal_loss(
     Returns:
         Scalar loss.
     """
-    pred = torch.clamp(torch.sigmoid(pred), min=1e-4, max=1 - 1e-4)
-    
-    # Positive locations: exact centers (target == 1)
-    pos_mask = target.eq(1).float()
-    pos_loss = -((1 - pred) ** alpha) * torch.log(pred) * pos_mask
-    
-    # Negative locations: everything else (target < 1)
-    neg_mask = target.lt(1).float()
-    neg_loss = (
-        -((1 - target) ** beta)
-        * (pred ** alpha)
-        * torch.log(1 - pred)
-        * neg_mask
-    )
-    
-    # Normalize by number of positive peaks
-    num_pos = pos_mask.sum().clamp(min=1.0)
-    loss = (pos_loss.sum() + neg_loss.sum()) / num_pos
-    
-    return loss
+    # [FP32 FIX] Force float32 to prevent fp16 sigmoid saturation -> nan.
+    with torch.cuda.amp.autocast(enabled=False):
+        pred = pred.float()
+        target = target.float()
+        pred = torch.clamp(torch.sigmoid(pred), min=1e-4, max=1 - 1e-4)
+        
+        # Positive locations: exact centers (target == 1)
+        pos_mask = target.eq(1).float()
+        pos_loss = -((1 - pred) ** alpha) * torch.log(pred) * pos_mask
+        
+        # Negative locations: everything else (target < 1)
+        neg_mask = target.lt(1).float()
+        neg_loss = (
+            -((1 - target) ** beta)
+            * (pred ** alpha)
+            * torch.log(1 - pred)
+            * neg_mask
+        )
+        
+        # Normalize by number of positive peaks
+        num_pos = pos_mask.sum().clamp(min=1.0)
+        loss = (pos_loss.sum() + neg_loss.sum()) / num_pos
+        
+        return loss
 
 
 # ==============================================================
@@ -383,7 +413,7 @@ class LossMonitor:
     
     Detects:
       - NaN or Inf losses.
-      - Sudden loss spikes (> spike_threshold × running mean).
+      - Sudden loss spikes (> spike_threshold x running mean).
       - Loss stagnation (no improvement for N epochs).
       - Component imbalance (one loss dominating the total).
     
@@ -408,7 +438,7 @@ class LossMonitor:
         Args:
             window_size: Number of recent values for running statistics.
             spike_threshold: A loss is a "spike" if it exceeds
-                            spike_threshold × running mean.
+                            spike_threshold x running mean.
             stagnation_patience: Number of epochs without improvement
                                 before flagging stagnation.
         """
@@ -429,7 +459,7 @@ class LossMonitor:
         Record loss values for one step.
         
         Args:
-            losses: Dict mapping component name → loss value (float or tensor).
+            losses: Dict mapping component name -> loss value (float or tensor).
             epoch: Current epoch (for stagnation tracking).
         """
         self._step_count += 1
@@ -464,7 +494,7 @@ class LossMonitor:
         Compute running statistics for each loss component.
         
         Returns:
-            Dict mapping component → {mean, std, min, max, latest, best}.
+            Dict mapping component -> {mean, std, min, max, latest, best}.
         """
         stats = {}
         for key, history in self._history.items():
@@ -700,8 +730,6 @@ class LossPackage:
 
 
 if __name__ == "__main__":
-    import numpy as np
-    
     print("=" * 60)
     print("  train/losses.py — Unit Test")
     print("=" * 60)
@@ -789,6 +817,18 @@ if __name__ == "__main__":
     assert not torch.isnan(hm_loss)
     assert hm_loss.item() > 0
     print("  ✓ Passed")
+    
+    # Test 5b: Focal loss with fp16 inputs (verify no nan)
+    print("\n[Test 5b] Focal Loss with fp16 inputs")
+    pred_fp16 = torch.randn(1, 1, 80, 80, dtype=torch.float16)
+    pred_fp16[0, 0, 0, 0] = 20.0   # sigmoid(20) = 1.0 in fp16
+    pred_fp16[0, 0, 0, 1] = -20.0  # sigmoid(-20) = 0.0 in fp16
+    target_fp16 = target_hm.half()
+    loss_fp16 = heatmap_focal_loss(pred_fp16, target_fp16)
+    assert not torch.isnan(loss_fp16), "Should not be nan with fp16 inputs"
+    assert not torch.isinf(loss_fp16), "Should not be inf with fp16 inputs"
+    print(f"  Loss with fp16 inputs: {loss_fp16.item():.4f}")
+    print("  ✓ No nan/inf — fp32 fix working")
     
     # Test 6: Loss Aggregator
     print("\n[Test 6] Loss Aggregator")

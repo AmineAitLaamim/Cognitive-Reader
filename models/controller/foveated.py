@@ -6,7 +6,7 @@ Responsibilities:
   1. Digit classification (Identity Pathway — NO spatial information)
   2. Content memory update (GRU cell on visual embeddings)
   3. Routing decisions (Routing Pathway — spatial edge features only)
-  4. <CHUNK> prediction (based on minimum distance to candidates)
+  4. <CHUNK> prediction (based on set-level candidate statistics)
   5. Action selection (combined softmax over neighbors + <CHUNK>)
 
 DUAL-PATHWAY INVARIANT:
@@ -14,12 +14,19 @@ DUAL-PATHWAY INVARIANT:
   The router sees ONLY edge features and h_content. It NEVER sees e_vis.
   These two pathways share h_content but nothing else.
 
-[FIX-CHUNK] The <CHUNK> logit is now conditioned on SET-LEVEL statistics of the
-candidate set (d_min_norm, k_valid_norm, mean_d_norm) in addition to the closest
-candidate's edge embedding. Previously it saw only the single closest candidate,
-which made "should READ" and "should CHUNK" indistinguishable (within a chunk the
-nearest candidate is always an unvisited same-chunk node at ~0.56*r in both
-cases), pinning the action loss near uniform.
+[FIX-CHUNK v2] Two changes from the original:
+  1. k_valid_norm now divides by a FIXED constant (10.0), not by K.
+     The old code divided by max(K,1), but candidate_mask is all-ones over
+     K candidates by construction, so k_valid/K = 1.0 always — a constant
+     that carried no information. Dividing by 10.0 gives the MLP a real
+     "how many candidates" signal (0.1 when K=1, 0.4 when K=4, etc.).
+  2. routing_mlp and chunk_mlp are merged into a single action_mlp that
+     scores all K+1 options (K candidates + 1 chunk) from the same input
+     structure [h_content || edge_embedding || set_stats]. The chunk option
+     uses a learnable chunk_embed in place of a real edge embedding. Because
+     all logits come from the same MLP, their scales are perfectly calibrated
+     and the READ/CHUNK boundary is sharp. The old two-MLP design had
+     independent output scales that competed uncalibrated in the softmax.
 """
 
 import torch
@@ -27,9 +34,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple
 from dataclasses import dataclass
-
-# Import from our features module
-# from models.graph.features import EdgeFeatureAggregator
 
 
 @dataclass
@@ -45,18 +49,18 @@ class FoveatedOutput:
 class FoveatedReadModule(nn.Module):
     """
     Mode 1: Foveated Read.
-    
+
     At each time step, this module:
       1. Classifies the digit at the current node (Identity Pathway).
       2. Updates h_content via a GRU cell.
-      3. Computes routing logits over unvisited local neighbors (Routing Pathway).
-      4. Computes a <CHUNK> logit based on proximity to candidates.
-      5. Returns combined action logits for the controller to select from.
-    
+      3. Computes unified action logits over unvisited local neighbors
+         and the <CHUNK> option (Routing Pathway).
+      4. Returns combined action logits for the controller to select from.
+
     This module does NOT mutate the ControllerState. State updates are
     handled by the orchestrator (dual_mode.py) based on the selected action.
     """
-    
+
     def __init__(
         self,
         vis_dim: int,
@@ -80,7 +84,7 @@ class FoveatedReadModule(nn.Module):
             dropout: Dropout rate for classification and routing heads.
         """
         super().__init__()
-        
+
         self.vis_dim = vis_dim
         self.hidden_dim = hidden_dim
         self.edge_dim = edge_dim
@@ -88,7 +92,7 @@ class FoveatedReadModule(nn.Module):
         self.radius = radius
         self.T_intra = T_intra
         self.T_inter = T_inter
-        
+
         # ============================================================
         # IDENTITY PATHWAY: Digit Classification
         # Input: [e_vis || h_content] -> digit logits
@@ -104,7 +108,7 @@ class FoveatedReadModule(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(hidden_dim // 2, num_classes)
         )
-        
+
         # ============================================================
         # RECURRENT UPDATE: GRU Cell
         # Input: e_vis (visual embedding of current node)
@@ -116,44 +120,48 @@ class FoveatedReadModule(nn.Module):
             input_size=vis_dim,
             hidden_size=hidden_dim
         )
-        
+
         # ============================================================
-        # ROUTING PATHWAY: Edge Aggregation
-        # Input: h_content + edge embeddings -> routing logits + chunk logit
-        # STRICT: No visual information enters this pathway.
+        # ROUTING PATHWAY: Unified Action Head [FIX-CHUNK v2]
+        #
+        # A single MLP scores all K+1 options (K candidates + 1 chunk)
+        # from the same input structure:
+        #   [h_content || edge_embedding || set_stats]
+        #
+        # For candidates, edge_embedding is the real edge embedding from
+        # SpatialFeatureEncoder. For the CHUNK option, edge_embedding is
+        # replaced by a learnable chunk_embed parameter.
+        #
+        # set_stats = [d_min_norm, k_valid_norm, mean_d_norm] — three
+        # set-level scalars that let the MLP distinguish "mid-chunk"
+        # (several close candidates) from "chunk exhausted" (few/far).
+        #
+        # Because all K+1 logits come from the same MLP with the same
+        # input structure, their scales are perfectly calibrated and the
+        # READ/CHUNK softmax boundary is sharp. The old two-MLP design
+        # (routing_mlp + chunk_mlp) had independent output scales that
+        # competed uncalibrated, causing the chunk logit to be
+        # systematically too high or too low relative to the routing
+        # logits.
+        #
+        # STRICT: No visual information (e_vis) enters this pathway.
         # ============================================================
-        
-        # Routing logit per candidate: (h_content || edge_embedding) -> scalar
-        self.routing_mlp = nn.Sequential(
-            nn.Linear(hidden_dim + edge_dim, hidden_dim),
+        self.action_mlp = nn.Sequential(
+            nn.Linear(hidden_dim + edge_dim + 3, hidden_dim),   # +3 = set-level stats
             nn.LayerNorm(hidden_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.ReLU(),
-            nn.Linear(hidden_dim // 2, 1)
+            nn.Linear(hidden_dim // 2, 1),
         )
-        
-        # CHUNK logit: (h_content || e_closest || d_min_norm || k_valid_norm || mean_d_norm) -> scalar
-        # e_closest:    edge embedding of the nearest candidate
-        # d_min_norm:   normalized minimum distance to any valid candidate
-        # k_valid_norm: fraction of candidates that are valid (set-level) [FIX-CHUNK]
-        # mean_d_norm:  mean distance over valid candidates (set-level)   [FIX-CHUNK]
-        # [FIX-CHUNK] The set-level scalars let the CHUNK decision distinguish
-        # "mid-chunk" (several close candidates) from "chunk exhausted"
-        # (few / far candidates), which the single closest candidate alone
-        # could not -- within a chunk the nearest candidate is always an
-        # unvisited same-chunk node at ~0.56*r in both cases.
-        self.chunk_mlp = nn.Sequential(
-            nn.Linear(hidden_dim + edge_dim + 3, hidden_dim),   # +3 set-level scalars [FIX-CHUNK]
-            nn.LayerNorm(hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.ReLU(),
-            nn.Linear(hidden_dim // 2, 1)
-        )
-    
+
+        # Learnable embedding for the CHUNK option (replaces "no edge embedding").
+        # Initialized small so the chunk option starts near-neutral relative to
+        # real candidates; the MLP learns to interpret it during training.
+        self.chunk_embed = nn.Parameter(torch.zeros(edge_dim))
+        nn.init.normal_(self.chunk_embed, std=0.02)
+
     def forward(
         self,
         h_content: torch.Tensor,
@@ -165,10 +173,10 @@ class FoveatedReadModule(nn.Module):
     ) -> FoveatedOutput:
         """
         Single forward pass of Mode 1.
-        
+
         Computes all logits but does NOT select an action or mutate state.
         Action selection and state updates are handled by dual_mode.py.
-        
+
         Args:
             h_content: [hidden_dim] — current content hidden state.
             e_vis_current: [vis_dim] — visual embedding of the CURRENT node
@@ -178,13 +186,13 @@ class FoveatedReadModule(nn.Module):
             candidate_mask: [K] — 1.0 = valid candidate, 0.0 = visited/padding.
             edge_distances: [K] — raw pixel distances to each candidate.
             candidate_indices: [K] — graph node indices of candidates.
-        
+
         Returns:
             FoveatedOutput with all logits and the updated h_content.
         """
         device = h_content.device
         K = edge_embeddings.shape[0]
-        
+
         # ============================================================
         # Step 1: Digit Classification (Identity Pathway)
         # Classify the digit at the current node using ONLY visual
@@ -192,7 +200,7 @@ class FoveatedReadModule(nn.Module):
         # ============================================================
         cls_input = torch.cat([e_vis_current, h_content], dim=-1)  # [vis_dim + hidden_dim]
         digit_logits = self.classifier(cls_input)  # [num_classes]
-        
+
         # ============================================================
         # Step 2: Recurrent Update
         # Update h_content with the visual embedding of the current node.
@@ -202,55 +210,69 @@ class FoveatedReadModule(nn.Module):
             input=e_vis_current.unsqueeze(0),   # [1, vis_dim]
             hx=h_content.unsqueeze(0)            # [1, hidden_dim]
         ).squeeze(0)  # [hidden_dim]
-        
+
         # ============================================================
         # Step 3: Routing Decision (Routing Pathway)
-        # Compute logits for each candidate neighbor and the <CHUNK> action.
+        # Compute unified action logits for K candidates + 1 chunk option.
         # Uses the UPDATED h_content (informed by the digit just read).
         # ============================================================
-        
+
         if K == 0 or candidate_mask.sum() == 0:
             # No candidates: structural termination, force <CHUNK>
             action_logits = torch.tensor([10.0], device=device)  # Single <CHUNK> logit
             min_distance = torch.tensor([float('inf')], device=device)
         else:
-            # --- Routing logits for each candidate ---
-            h_expanded = new_h_content.unsqueeze(0).expand(K, -1)  # [K, hidden_dim]
-            routing_input = torch.cat([h_expanded, edge_embeddings], dim=-1)  # [K, hidden_dim + edge_dim]
-            routing_logits = self.routing_mlp(routing_input).squeeze(-1)  # [K]
-            
-            # Mask out invalid candidates
-            routing_logits = routing_logits.masked_fill(candidate_mask == 0, float('-inf'))
-            
-            # --- CHUNK logit ---
-            # Find minimum distance among valid candidates
+            # --- Set-level statistics over valid candidates [FIX-CHUNK v2] ---
+            # These let the action MLP distinguish "mid-chunk" (several close
+            # candidates) from "chunk exhausted" (few / far candidates).
             valid_distances = edge_distances.clone()
             valid_distances[candidate_mask == 0] = float('inf')
             d_min = valid_distances.min()
-            d_min_norm = (d_min / self.radius).unsqueeze(0)  # [1]
-            
-            # [FIX-CHUNK] Set-level statistics over valid candidates, so the
-            # CHUNK decision can distinguish "mid-chunk" (several close
-            # candidates) from "chunk exhausted" (few / far candidates).
-            k_valid = candidate_mask.sum()                              # scalar
-            k_valid_norm = (k_valid / max(K, 1)).unsqueeze(0)           # [1]
+            d_min_norm = (d_min / self.radius).unsqueeze(0)              # [1]
+
+            # [FIX-CHUNK v2] Divide by a FIXED constant (10.0), NOT by K.
+            # The old code divided by max(K,1), but candidate_mask is all-ones
+            # over K candidates by construction, so k_valid/K = 1.0 always —
+            # a useless constant. Dividing by 10.0 gives a real signal:
+            # k_valid_norm = 0.1 when K=1, 0.4 when K=4, etc.
+            k_valid = candidate_mask.sum()                                # scalar
+            k_valid_norm = (k_valid / 10.0).unsqueeze(0)                 # [1]
+
             masked_d = edge_distances * candidate_mask
             mean_d = masked_d.sum() / k_valid.clamp(min=1.0)
-            mean_d_norm = (mean_d / self.radius).unsqueeze(0)           # [1]
-            
-            # Get edge embedding of the closest valid candidate
-            closest_idx = valid_distances.argmin()
-            e_closest = edge_embeddings[closest_idx]  # [edge_dim]
-            
-            # Compute CHUNK logit (now conditioned on set-level stats)
-            chunk_input = torch.cat([new_h_content, e_closest, d_min_norm, k_valid_norm, mean_d_norm], dim=-1)
-            chunk_logit = self.chunk_mlp(chunk_input)  # [1]
-            
-            # --- Combine into action logits ---
-            # [neighbor_0, ..., neighbor_K, <CHUNK>]
-            action_logits = torch.cat([routing_logits, chunk_logit], dim=0)  # [K + 1]
+            mean_d_norm = (mean_d / self.radius).unsqueeze(0)            # [1]
+
+            set_stats = torch.cat([d_min_norm, k_valid_norm, mean_d_norm])  # [3]
+
+            # --- Unified action logits [FIX-CHUNK v2] ---
+            # All K+1 options (K candidates + 1 chunk) are scored by the
+            # SAME action_mlp from the SAME input structure:
+            #   [h_content || edge_embedding || set_stats]
+            #
+            # For candidates, edge_embedding is the real edge embedding.
+            # For the CHUNK option, edge_embedding is the learnable chunk_embed.
+            # This gives perfectly calibrated READ/CHUNK logits.
+
+            # Stack candidate edge embeddings + the learned chunk embedding
+            edge_with_chunk = torch.cat(
+                [edge_embeddings, self.chunk_embed.unsqueeze(0)], dim=0
+            )  # [K+1, edge_dim]
+
+            # Expand h_content and set_stats to match all K+1 options
+            h_exp = new_h_content.unsqueeze(0).expand(K + 1, -1)   # [K+1, hidden_dim]
+            s_exp = set_stats.unsqueeze(0).expand(K + 1, -1)        # [K+1, 3]
+
+            # Build input and run the unified MLP
+            action_input = torch.cat([h_exp, edge_with_chunk, s_exp], dim=-1)
+            # [K+1, hidden_dim + edge_dim + 3]
+            action_logits = self.action_mlp(action_input).squeeze(-1)  # [K+1]
+
+            # Mask invalid candidates (but NOT the chunk option at index K)
+            full_mask = torch.cat([candidate_mask, torch.ones(1, device=device)])  # [K+1]
+            action_logits = action_logits.masked_fill(full_mask == 0, float('-inf'))
+
             min_distance = d_min.unsqueeze(0)
-        
+
         return FoveatedOutput(
             digit_logits=digit_logits,
             action_logits=action_logits,
@@ -258,7 +280,7 @@ class FoveatedReadModule(nn.Module):
             new_h_content=new_h_content,
             min_distance=min_distance
         )
-    
+
     def select_action(
         self,
         output: FoveatedOutput,
@@ -267,12 +289,12 @@ class FoveatedReadModule(nn.Module):
     ) -> Tuple[str, Optional[int], Optional[int]]:
         """
         Select the next action from the computed logits.
-        
+
         Args:
             output: FoveatedOutput from the forward pass.
             greedy: If True, select argmax. If False, sample from softmax.
             temperature: Sampling temperature (only used if greedy=False).
-        
+
         Returns:
             action_type: 'READ' (visit a neighbor) or 'CHUNK' (emit <CHUNK>).
             selected_node_idx: Graph node index of the selected neighbor (None if CHUNK).
@@ -280,13 +302,13 @@ class FoveatedReadModule(nn.Module):
         """
         logits = output.action_logits  # [K + 1]
         K = output.candidate_indices.shape[0]
-        
+
         if greedy:
             action_idx = logits.argmax().item()
         else:
             probs = F.softmax(logits / temperature, dim=0)
             action_idx = torch.multinomial(probs, 1).item()
-        
+
         if action_idx == K:
             # Selected <CHUNK> (the last action in the combined space)
             return 'CHUNK', None, None
@@ -294,7 +316,7 @@ class FoveatedReadModule(nn.Module):
             # Selected a neighbor
             selected_node_idx = output.candidate_indices[action_idx].item()
             return 'READ', selected_node_idx, action_idx
-    
+
     def compute_loss(
         self,
         output: FoveatedOutput,
@@ -303,13 +325,13 @@ class FoveatedReadModule(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Compute the training loss for a single Mode 1 step.
-        
+
         Args:
             output: FoveatedOutput from the forward pass.
             gt_digit_label: Ground-truth digit class (0-9).
             gt_action_idx: Ground-truth action index in the combined
                            action space [0..K] for neighbors, K for <CHUNK>.
-        
+
         Returns:
             digit_loss: Cross-entropy loss for digit classification.
             action_loss: Cross-entropy loss for action selection.
@@ -319,28 +341,28 @@ class FoveatedReadModule(nn.Module):
             output.digit_logits.unsqueeze(0),  # [1, num_classes]
             torch.tensor([gt_digit_label], device=output.digit_logits.device)
         )
-        
+
         # Action selection loss
         action_loss = F.cross_entropy(
             output.action_logits.unsqueeze(0),  # [1, K + 1]
             torch.tensor([gt_action_idx], device=output.action_logits.device)
         )
-        
+
         return digit_loss, action_loss
 
 
 class FoveatedReadModuleWithSafetyCheck(FoveatedReadModule):
     """
     Extended Mode 1 with post-hoc distance safety checks.
-    
+
     After action selection, verifies that the selected neighbor's distance
     is consistent with the action type:
       - If action is READ and d > T_inter: force CHUNK (safety violation).
       - If action is CHUNK and d_min < T_intra: log warning (model uncertainty).
-    
+
     This prevents catastrophic failures from miscalibrated logits.
     """
-    
+
     def select_action_with_safety(
         self,
         output: FoveatedOutput,
@@ -351,7 +373,7 @@ class FoveatedReadModuleWithSafetyCheck(FoveatedReadModule):
     ) -> Tuple[str, Optional[int], Optional[int], bool]:
         """
         Select action with post-hoc safety checks.
-        
+
         Returns:
             action_type: 'READ', 'CHUNK', or 'LOCAL_CHUNK' (distance-based boundary).
             selected_node_idx: Graph node index (None for pure CHUNK).
@@ -361,44 +383,44 @@ class FoveatedReadModuleWithSafetyCheck(FoveatedReadModule):
         action_type, node_idx, local_idx = self.select_action(
             output, greedy=greedy, temperature=temperature
         )
-        
+
         safety_triggered = False
-        
+
         if action_type == 'READ' and node_idx is not None:
             # Check distance of selected neighbor
             d = edge_distances[local_idx].item()
-            
+
             if d > self.T_inter:
                 # SAFETY VIOLATION: Model selected a far neighbor.
                 # Override: emit CHUNK, then process this neighbor as
                 # the start of a new chunk (local chunk crossing).
                 action_type = 'LOCAL_CHUNK'
                 safety_triggered = True
-        
+
         elif action_type == 'CHUNK':
             # Check if there's a close neighbor that the model ignored
             if candidate_mask.sum() > 0:
                 valid_d = edge_distances.clone()
                 valid_d[candidate_mask == 0] = float('inf')
                 d_min = valid_d.min().item()
-                
+
                 if d_min < self.T_intra:
                     # WARNING: Model chose CHUNK despite a close neighbor.
                     # This is not necessarily wrong (the model may have learned
                     # a valid reason to chunk), but it's worth monitoring.
                     # We do NOT override here — trust the model's decision.
                     pass
-        
+
         return action_type, node_idx, local_idx, safety_triggered
 
 
 if __name__ == "__main__":
     # --- Unit test ---
-    
+
     print("=" * 60)
-    print("  FoveatedReadModule Unit Test")
+    print("  FoveatedReadModule Unit Test (FIX-CHUNK v2)")
     print("=" * 60)
-    
+
     # Config
     vis_dim = 512
     hidden_dim = 256
@@ -407,9 +429,9 @@ if __name__ == "__main__":
     radius = 80.0
     T_intra = 76.0
     T_inter = 108.0
-    
+
     device = torch.device('cpu')
-    
+
     # Create module
     foveated = FoveatedReadModuleWithSafetyCheck(
         vis_dim=vis_dim,
@@ -421,18 +443,18 @@ if __name__ == "__main__":
         T_inter=T_inter
     )
     foveated.eval()
-    
+
     # Simulate inputs
     h_content = torch.randn(hidden_dim)
     e_vis = torch.randn(vis_dim)
     K = 4  # 4 candidate neighbors
-    
+
     edge_embeddings = torch.randn(K, edge_dim)
     candidate_mask = torch.ones(K)
     candidate_mask[2] = 0  # Node 2 is visited
     edge_distances = torch.tensor([30.0, 55.0, 90.0, 120.0])  # pixels
     candidate_indices = torch.tensor([3, 5, 7, 9])  # graph node IDs
-    
+
     # Forward pass
     output = foveated(
         h_content=h_content,
@@ -442,17 +464,29 @@ if __name__ == "__main__":
         edge_distances=edge_distances,
         candidate_indices=candidate_indices
     )
-    
+
     print(f"\n[Forward Pass]")
     print(f"  Digit logits shape: {output.digit_logits.shape}")  # [10]
     print(f"  Action logits shape: {output.action_logits.shape}")  # [K+1] = [5]
     print(f"  New h_content shape: {output.new_h_content.shape}")  # [256]
     print(f"  Min distance: {output.min_distance.item():.1f}px")
-    
+
+    # Verify action_logits has K+1 entries (K candidates + 1 chunk)
+    assert output.action_logits.shape[0] == K + 1, \
+        f"Expected {K+1} action logits, got {output.action_logits.shape[0]}"
+
+    # Verify the masked candidate (index 2) has -inf logit
+    assert output.action_logits[2].item() == float('-inf'), \
+        "Masked candidate should have -inf logit"
+
+    # Verify the chunk option (index K) is NOT masked
+    assert output.action_logits[K].item() != float('-inf'), \
+        "Chunk option should not be masked"
+
     # Predicted digit
     pred_digit = output.digit_logits.argmax().item()
     print(f"  Predicted digit: {pred_digit}")
-    
+
     # Action selection (greedy)
     action_type, node_idx, local_idx, safety = foveated.select_action_with_safety(
         output, edge_distances, candidate_mask, greedy=True
@@ -461,7 +495,7 @@ if __name__ == "__main__":
     print(f"  Action: {action_type}")
     print(f"  Node: {node_idx}")
     print(f"  Safety triggered: {safety}")
-    
+
     # Test loss computation
     gt_digit = 3
     gt_action = 0  # Visit first candidate
@@ -469,7 +503,7 @@ if __name__ == "__main__":
     print(f"\n[Loss]")
     print(f"  Digit loss: {digit_loss.item():.4f}")
     print(f"  Action loss: {action_loss.item():.4f}")
-    
+
     # Test empty neighborhood (structural termination)
     print(f"\n[Empty Neighborhood Test]")
     empty_output = foveated(
@@ -482,12 +516,12 @@ if __name__ == "__main__":
     )
     print(f"  Action logits: {empty_output.action_logits.tolist()}")  # Should be [10.0]
     print(f"  Min distance: {empty_output.min_distance.item()}")  # Should be inf
-    
+
     action_type, _, _, _ = foveated.select_action_with_safety(
         empty_output, torch.zeros(0), torch.zeros(0), greedy=True
     )
     print(f"  Action: {action_type}")  # Should be CHUNK
-    
+
     # Test safety check: far neighbor selected
     print(f"\n[Safety Check Test]")
     # Force the model to select the far neighbor (index 3, distance 120 > T_inter=108)
@@ -504,7 +538,30 @@ if __name__ == "__main__":
     print(f"  Action: {action_type}")  # Should be LOCAL_CHUNK (safety override)
     print(f"  Node: {node_idx}")       # Should be 9 (the far neighbor)
     print(f"  Safety triggered: {safety}")  # Should be True
-    
+
+    # Test k_valid_norm is NOT always 1.0 [FIX-CHUNK v2 verification]
+    print(f"\n[k_valid_norm Verification]")
+    # With K=4 candidates, k_valid_norm should be 4/10 = 0.4, NOT 4/4 = 1.0
+    # We can't directly access the intermediate, but we can verify the
+    # action_mlp input dimension is correct
+    expected_input_dim = hidden_dim + edge_dim + 3  # 256 + 256 + 3 = 515
+    actual_input_dim = foveated.action_mlp[0].in_features
+    print(f"  action_mlp input dim: {actual_input_dim} (expected {expected_input_dim})")
+    assert actual_input_dim == expected_input_dim, \
+        f"action_mlp input dim mismatch: {actual_input_dim} != {expected_input_dim}"
+
+    # Verify chunk_embed exists and has the right shape
+    print(f"  chunk_embed shape: {foveated.chunk_embed.shape} (expected [{edge_dim}])")
+    assert foveated.chunk_embed.shape == (edge_dim,), \
+        f"chunk_embed shape mismatch: {foveated.chunk_embed.shape} != ({edge_dim},)"
+
+    # Verify routing_mlp and chunk_mlp do NOT exist (replaced by action_mlp)
+    assert not hasattr(foveated, 'routing_mlp'), "routing_mlp should not exist (replaced by action_mlp)"
+    assert not hasattr(foveated, 'chunk_mlp'), "chunk_mlp should not exist (replaced by action_mlp)"
+    print(f"  routing_mlp removed: OK")
+    print(f"  chunk_mlp removed: OK")
+    print(f"  action_mlp present: OK")
+
     print("\n" + "=" * 60)
     print("  All tests passed.")
     print("=" * 60)

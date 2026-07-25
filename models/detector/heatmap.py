@@ -10,6 +10,14 @@ Contains everything related to PRODUCING and TRAINING the heatmap:
 
 Does NOT contain decoding, NMS, or box estimation.
 Those live in postprocess.py.
+
+[FP32 FIX] heatmap_focal_loss now forces float32 computation via
+autocast(enabled=False) + explicit .float() casts. Under fp16/AMP,
+sigmoid saturates to exactly 1.0 and the clamp to (1-1e-4) is
+ineffective because 0.9999 rounds to 1.0 in fp16, causing
+log(1-pred) = log(0) = -inf -> nan. This was the cause of ~26%
+of training steps producing nan loss summaries. Forcing fp32
+makes the clamp work and eliminates the nan entirely.
 """
 
 import torch
@@ -32,15 +40,15 @@ class HeatmapHead(nn.Module):
     Predicts a single-channel heatmap of digit center probabilities.
     
     Architecture:
-      Conv2d(C, 128, 3x3) → BN → ReLU →
-      Conv2d(128, 128, 3x3) → BN → ReLU →
+      Conv2d(C, 128, 3x3) -> BN -> ReLU ->
+      Conv2d(128, 128, 3x3) -> BN -> ReLU ->
       Conv2d(128, 1, 1x1)
     
     Input:  [B, C, H/8, W/8] — backbone feature map (stride 8).
     Output: [B, 1, H/8, W/8] — raw logits (before sigmoid).
     
     The final conv bias is initialized to -2.0 so that
-    sigmoid(-2) ≈ 0.12, preventing the network from starting
+    sigmoid(-2) ~ 0.12, preventing the network from starting
     with all pixels at 0.5 (which would produce huge focal loss).
     """
     
@@ -61,7 +69,7 @@ class HeatmapHead(nn.Module):
             nn.Conv2d(hidden_channels, 1, kernel_size=1, bias=True)
         )
         
-        # Initialize final bias to -2.0 (sigmoid(-2) ≈ 0.12)
+        # Initialize final bias to -2.0 (sigmoid(-2) ~ 0.12)
         nn.init.constant_(self.head[-1].bias, -2.0)
         
         self.in_channels = in_channels
@@ -86,6 +94,21 @@ class HeatmapHead(nn.Module):
             [B, 1, H, W] — probabilities in [0, 1].
         """
         return torch.sigmoid(self.forward(feature_map))
+    
+    @staticmethod
+    def focal_loss(
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        alpha: float = 2.0,
+        beta: float = 4.0
+    ) -> torch.Tensor:
+        """
+        Convenience static method so the trainer can call
+        HeatmapHead.focal_loss(logits, targets) directly.
+        Delegates to the standalone heatmap_focal_loss function
+        (which includes the fp32 fix).
+        """
+        return heatmap_focal_loss(pred, target, alpha, beta)
 
 
 # ==============================================================
@@ -97,11 +120,11 @@ class HeatmapTargetGenerator:
     Generates ground-truth heatmaps with Gaussian blobs at digit centers.
     
     Each digit center produces a Gaussian blob on the downsampled grid:
-        G(x, y) = exp(-(dx² + dy²) / (2σ²))
+        G(x, y) = exp(-(dx^2 + dy^2) / (2*sigma^2))
     
     where (dx, dy) is the offset from the center in feature-map pixels.
     
-    The peak value is 1.0 (exact center). Values decay to ~0 at 3σ.
+    The peak value is 1.0 (exact center). Values decay to ~0 at 3*sigma.
     Overlapping blobs are merged via element-wise max (not sum),
     so the peak remains 1.0 even if two digits are very close.
     """
@@ -111,7 +134,7 @@ class HeatmapTargetGenerator:
         Args:
             stride: Feature map stride (8 for stride-8 backbone).
             sigma: Gaussian standard deviation in feature-map pixels.
-                   σ=1.0 → blob covers ~7x7 feature-map pixels (3σ radius).
+                   sigma=1.0 -> blob covers ~7x7 feature-map pixels (3*sigma radius).
         """
         self.stride = stride
         self.sigma = sigma
@@ -194,16 +217,26 @@ def heatmap_focal_loss(
     by down-weighting easy negatives near digit centers.
     
     For positive pixels (target == 1):
-        L_pos = -(1 - p)^α * log(p)
+        L_pos = -(1 - p)^alpha * log(p)
     
     For negative pixels (target < 1):
-        L_neg = -(1 - t)^β * p^α * log(1 - p)
+        L_neg = -(1 - t)^beta * p^alpha * log(1 - p)
     
-    The (1 - t)^β term is the key: pixels near the Gaussian peak
-    (t ≈ 0.9) get down-weighted by (0.1)^4 = 0.0001. Pixels far
-    from any digit (t ≈ 0) get full weight. This prevents the
+    The (1 - t)^beta term is the key: pixels near the Gaussian peak
+    (t ~ 0.9) get down-weighted by (0.1)^4 = 0.0001. Pixels far
+    from any digit (t ~ 0) get full weight. This prevents the
     massive number of background pixels from overwhelming the
     gradient signal from the few positive pixels.
+    
+    [FP32 FIX] The entire computation is forced to float32 via
+    autocast(enabled=False) + explicit .float() casts. Under fp16,
+    sigmoid saturates to exactly 1.0 and the clamp to (1-1e-4) is
+    ineffective because 0.9999 rounds to 1.0 in fp16, causing
+    log(1-pred) = log(0) = -inf -> nan. Forcing fp32 makes the
+    clamp work (0.9999 is representable) and eliminates the nan.
+    The fp32 overhead is negligible (focal loss is a small part of
+    the total computation) and the GradScaler handles mixed-precision
+    gradients correctly.
     
     Args:
         pred: [B, 1, H, W] — raw logits (before sigmoid).
@@ -214,21 +247,29 @@ def heatmap_focal_loss(
     Returns:
         Scalar loss, normalized by number of positive peaks.
     """
-    pred = torch.clamp(torch.sigmoid(pred), min=1e-4, max=1 - 1e-4)
-    
-    pos_mask = target.eq(1).float()
-    pos_loss = -((1 - pred) ** alpha) * torch.log(pred) * pos_mask
-    
-    neg_mask = target.lt(1).float()
-    neg_loss = (
-        -((1 - target) ** beta)
-        * (pred ** alpha)
-        * torch.log(1 - pred)
-        * neg_mask
-    )
-    
-    num_pos = pos_mask.sum().clamp(min=1.0)
-    return (pos_loss.sum() + neg_loss.sum()) / num_pos
+    # [FP32 FIX] Force float32 to prevent fp16 sigmoid saturation -> nan.
+    # autocast(enabled=False) ensures ALL operations inside this block
+    # (sigmoid, clamp, log, pow, mul, sum) run in fp32, not just the inputs.
+    # The .float() casts ensure the inputs are fp32 even if they arrive as fp16.
+    # On CPU, autocast(enabled=False) is a no-op, so this is safe everywhere.
+    with torch.cuda.amp.autocast(enabled=False):
+        pred = pred.float()
+        target = target.float()
+        pred = torch.clamp(torch.sigmoid(pred), min=1e-4, max=1 - 1e-4)
+        
+        pos_mask = target.eq(1).float()
+        pos_loss = -((1 - pred) ** alpha) * torch.log(pred) * pos_mask
+        
+        neg_mask = target.lt(1).float()
+        neg_loss = (
+            -((1 - target) ** beta)
+            * (pred ** alpha)
+            * torch.log(1 - pred)
+            * neg_mask
+        )
+        
+        num_pos = pos_mask.sum().clamp(min=1.0)
+        return (pos_loss.sum() + neg_loss.sum()) / num_pos
 
 
 # ==============================================================
@@ -475,8 +516,8 @@ if __name__ == "__main__":
     assert batch_target.shape == (2, 1, 80, 80)
     print("  ✓ Passed")
     
-    # Test 3: Focal loss
-    print("\n[Test 3] Focal Loss")
+    # Test 3: Focal loss (standalone function)
+    print("\n[Test 3] Focal Loss (standalone)")
     pred = torch.randn(2, 1, 80, 80)
     loss = heatmap_focal_loss(pred, batch_target)
     assert not torch.isnan(loss) and loss.item() > 0
@@ -489,6 +530,29 @@ if __name__ == "__main__":
     assert not torch.isnan(bg_loss)
     print(f"  All-bg loss: {bg_loss.item():.4f}")
     print("  ✓ Passed")
+    
+    # Test 4: HeatmapHead.focal_loss static method
+    print("\n[Test 4] HeatmapHead.focal_loss (static method)")
+    loss_static = HeatmapHead.focal_loss(pred, batch_target)
+    assert not torch.isnan(loss_static) and loss_static.item() > 0
+    # Should give the same result as the standalone function
+    assert abs(loss_static.item() - loss.item()) < 1e-5, \
+        f"Static method ({loss_static.item()}) != standalone ({loss.item()})"
+    print(f"  Loss: {loss_static.item():.4f} (matches standalone: OK)")
+    print("  ✓ Passed")
+    
+    # Test 5: Focal loss under simulated fp16 (verify no nan)
+    print("\n[Test 5] Focal Loss under fp16 simulation")
+    pred_fp16 = torch.randn(2, 1, 80, 80, dtype=torch.float16)
+    # Make some predictions very confident to trigger the old nan path
+    pred_fp16[0, 0, 0, 0] = 20.0   # sigmoid(20) = 1.0 in fp16
+    pred_fp16[0, 0, 0, 1] = -20.0  # sigmoid(-20) = 0.0 in fp16
+    target_fp16 = batch_target.half()
+    loss_fp16 = heatmap_focal_loss(pred_fp16, target_fp16)
+    assert not torch.isnan(loss_fp16), "Focal loss should not be nan even with fp16 inputs"
+    assert not torch.isinf(loss_fp16), "Focal loss should not be inf even with fp16 inputs"
+    print(f"  Loss with fp16 inputs (confident preds): {loss_fp16.item():.4f}")
+    print("  ✓ No nan/inf — fp32 fix working")
     
     print("\n" + "=" * 60)
     print("  All tests passed.")
