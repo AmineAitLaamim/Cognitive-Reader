@@ -1,0 +1,7 @@
+GT:   1635<CHUNK>499<CHUNK>8<CHUNK>35
+PRED: 536<CHUNK>513<CHUNK>499<CHUNK>8<CHUNK>
+Exact match: 0.0
+Digit acc:   0.1000
+Chunk F1:    0.0000
+Steps:       10
+Time:        858.9ms

@@ -19,12 +19,14 @@ Execution Flow:
 
 Two entry points:
   - forward_train(): Teacher-forced training with ground-truth actions.
+    Supports scheduled sampling (sampling_ratio > 0) to combat exposure bias.
   - forward_inference(): Autoregressive decoding with greedy/sampling.
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import random
 from typing import List, Dict, Tuple, Optional, Any
 from dataclasses import dataclass
 
@@ -264,6 +266,54 @@ class DualModeController(nn.Module):
         return steps
 
     # ==============================================================
+    # SCHEDULED SAMPLING HELPER
+    # ==============================================================
+
+    def _scheduled_sampling_h_content(
+        self,
+        foveated_out: FoveatedOutput,
+        graph: SpatialGraph,
+        state: ControllerState,
+        device: torch.device,
+        sampling_ratio: float
+    ) -> None:
+        """
+        [SCHEDULED SAMPLING] With probability sampling_ratio, override
+        state.h_content with the model's own READ/CHUNK prediction instead
+        of the GT action's h_content.
+
+        This combats exposure bias: at inference the model's h_content is
+        updated by its OWN predictions (which diverge from GT), but during
+        pure teacher forcing h_content always follows the GT trajectory.
+        By randomly using the model's own prediction to update h_content,
+        the model learns to handle its own divergent recurrent state.
+
+        Only h_content is overridden. The trajectory (node positions,
+        visited mask, tokens, mode) always follows the GT path.
+        """
+        if sampling_ratio <= 0 or random.random() >= sampling_ratio:
+            return  # Standard teacher forcing; do not override
+
+        with torch.no_grad():
+            ss_type, ss_node, ss_local = self.foveated.select_action(
+                foveated_out, greedy=True
+            )
+
+        if ss_type == 'CHUNK':
+            # Model predicted CHUNK: zero h_content
+            state.h_content = torch.zeros_like(state.h_content)
+        elif ss_node is not None:
+            # Model predicted READ: update h_content with predicted
+            # neighbor's e_vis via the GRU (starting from the h_content
+            # that was current when the action logits were computed)
+            ss_e_vis = graph.node_embeddings[ss_node].to(device)
+            state.h_content = self.foveated.gru_cell(
+                input=ss_e_vis.unsqueeze(0),
+                hx=foveated_out.new_h_content.unsqueeze(0)
+            ).squeeze(0)
+        # If ss_node is None (shouldn't happen for READ), keep h_content as is
+
+    # ==============================================================
     # TRAINING: TEACHER FORCING
     # ==============================================================
 
@@ -272,7 +322,8 @@ class DualModeController(nn.Module):
         graph: SpatialGraph,
         gt_sequence: List[Dict],
         cls_token: torch.Tensor,
-        device: torch.device = torch.device('cpu')
+        device: torch.device = torch.device('cpu'),
+        sampling_ratio: float = 0.0
     ) -> DualModeOutput:
         """
         Teacher-forced training loop.
@@ -282,6 +333,10 @@ class DualModeController(nn.Module):
             gt_sequence: Ground-truth sequence from data generator.
             cls_token: [vis_dim] global image feature from backbone GAP.
             device: Torch device.
+            sampling_ratio: [SCHEDULED SAMPLING] Probability of using the
+                model's own prediction (instead of GT) to update h_content.
+                0.0 = pure teacher forcing (default, backward compatible).
+                Grows from 0 to ~0.5 over training to combat exposure bias.
 
         Returns:
             DualModeOutput with total loss and diagnostics.
@@ -331,28 +386,14 @@ class DualModeController(nn.Module):
                     greedy=True
                 )
 
-                # [FIX-JUMP] The GT jump target (the generator's placement order)
-                # is not identifiable from the image: at t=0 the query is CLS-only
-                # and carries no "which cluster is first" signal, and in general
-                # nothing in the pixels marks the canonical next chunk. Training
-                # the saccadic head against that arbitrary permutation pins its
-                # cross-entropy at the uniform floor ln(K) forever (observed:
-                # jump loss flat ~2.6-2.7 for 13 epochs with full gradient and a
-                # correct visited mask). Instead, supervise the jump HEAD toward
-                # the nearest UNVISITED node that lies outside the current chunk:
-                # a deterministic function of (positions, visited, current) that
-                # the query+keys can in principle learn (it learns greedy-nearest-
-                # chunk, a valid reading order). The TRAJECTORY is still teacher-
-                # forced on gt_step.node_id below, so the digit/action contexts
-                # stay on the real path -- only the jump head's label changes.
+                # [FIX-JUMP] Supervise the jump head toward the nearest
+                # UNVISITED node outside the current chunk (a state-computable,
+                # learnable target). The trajectory is still teacher-forced on
+                # gt_step.node_id below; only the jump head's label changes.
                 # t=0 (not state.initialized) has no current position and the
                 # first chunk's identity is arbitrary, so its jump loss is
                 # skipped entirely (order-invariant reading does not need it).
                 if state.initialized:
-                    # [FIX-JUMP] supervise the jump head toward the nearest
-                    # UNVISITED node outside the current chunk (a state-computable,
-                    # learnable target). The trajectory is still teacher-forced on
-                    # gt_step.node_id below; only the jump head's label changes.
                     # [device-fix] route every tensor through `device` so the
                     # boolean `&` never mixes cuda (graph) with cpu (state).
                     vm = state.visited_mask.to(device)                              # [N]
@@ -404,9 +445,7 @@ class DualModeController(nn.Module):
                 # [cand_0 .. cand_{n-1}, CHUNK]. This must match
                 # FoveatedReadModule.forward (how action_logits is stacked) and
                 # FoveatedReadModule.select_action (how a local index decodes to a
-                # node vs CHUNK). If the action loss stays flat after retrain, the
-                # mismatch lives in foveated.py (flip the CHUNK slot there), NOT
-                # here -- do not change this convention blindly.
+                # node vs CHUNK).
                 if gt_step.action == 'READ' and gt_step.action_target_node is not None:
                     target_local_idx = (cand_indices == gt_step.action_target_node).nonzero(as_tuple=True)
                     if len(target_local_idx[0]) > 0:
@@ -423,8 +462,15 @@ class DualModeController(nn.Module):
                 total_action_loss = total_action_loss + action_loss
                 num_action_steps += 1
 
+                # Follow GT trajectory for state updates
                 if gt_step.action == 'CHUNK':
                     state.update_after_chunk()
+
+                # [SCHEDULED SAMPLING] Override h_content with model's own
+                # prediction (trajectory already followed GT above).
+                self._scheduled_sampling_h_content(
+                    foveated_out, graph, state, device, sampling_ratio
+                )
 
             elif gt_step.mode == 'READ':
                 # ============================================
@@ -464,6 +510,7 @@ class DualModeController(nn.Module):
                 total_action_loss = total_action_loss + action_loss
                 num_action_steps += 1
 
+                # Follow GT trajectory for state updates
                 if gt_step.action == 'READ' and gt_step.action_target_node is not None:
                     target_node = gt_step.action_target_node
                     node_pos_norm = graph.node_positions_norm[target_node].to(device)
@@ -479,6 +526,12 @@ class DualModeController(nn.Module):
                 else:
                     state.h_content = foveated_out.new_h_content
                     state.update_after_chunk()
+
+                # [SCHEDULED SAMPLING] Override h_content with model's own
+                # prediction (trajectory already followed GT above).
+                self._scheduled_sampling_h_content(
+                    foveated_out, graph, state, device, sampling_ratio
+                )
 
         # Compute weighted total loss
         avg_digit_loss = total_digit_loss / max(num_digit_steps, 1)
@@ -738,6 +791,13 @@ if __name__ == "__main__":
     assert steps[4].action == 'CHUNK'
 
     print(f"\n  ✓ GT parsing verified")
+
+    # Verify scheduled sampling parameter exists and defaults to 0
+    import inspect
+    sig = inspect.signature(controller.forward_train)
+    assert 'sampling_ratio' in sig.parameters, "sampling_ratio parameter missing"
+    assert sig.parameters['sampling_ratio'].default == 0.0, "sampling_ratio default should be 0.0"
+    print(f"  ✓ sampling_ratio parameter verified (default=0.0)")
 
     print("\n" + "=" * 60)
     print("  All structural checks passed.")

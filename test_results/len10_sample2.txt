@@ -1,0 +1,7 @@
+GT:   4<CHUNK>01<CHUNK>36<CHUNK>3047<CHUNK>8
+PRED: 47<CHUNK>303<CHUNK>8<CHUNK>4<CHUNK>1<CHUNK>6<CHUNK>0<CHUNK>
+Exact match: 0.0
+Digit acc:   0.1000
+Chunk F1:    0.3636
+Steps:       10
+Time:        834.5ms

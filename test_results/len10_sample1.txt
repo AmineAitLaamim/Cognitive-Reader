@@ -1,0 +1,7 @@
+GT:   592<CHUNK>8126<CHUNK>027
+PRED: 295<CHUNK>18<CHUNK>2<CHUNK>6<CHUNK>7<CHUNK>21<CHUNK>
+Exact match: 0.0
+Digit acc:   0.4000
+Chunk F1:    0.5000
+Steps:       10
+Time:        845.9ms

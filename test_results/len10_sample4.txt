@@ -1,0 +1,7 @@
+GT:   0707<CHUNK>8<CHUNK>0319<CHUNK>8
+PRED: 7<CHUNK>013<CHUNK>9<CHUNK>8<CHUNK>707<CHUNK>1<CHUNK>
+Exact match: 0.0
+Digit acc:   0.0000
+Chunk F1:    0.6667
+Steps:       10
+Time:        830.3ms

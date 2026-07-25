@@ -1,0 +1,7 @@
+GT:   5<CHUNK>0<CHUNK>4386<CHUNK>4152
+PRED: 5<CHUNK>0<CHUNK>438<CHUNK>6<CHUNK>152<CHUNK>4<CHUNK>
+Exact match: 0.0
+Digit acc:   0.6000
+Chunk F1:    0.6667
+Steps:       10
+Time:        854.8ms

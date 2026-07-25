@@ -1,0 +1,7 @@
+GT:   480<CHUNK>221<CHUNK>9<CHUNK>674
+PRED: 21<CHUNK>6<CHUNK>9<CHUNK>41<CHUNK>674<CHUNK>2<CHUNK>
+Exact match: 0.0
+Digit acc:   0.1000
+Chunk F1:    0.4444
+Steps:       10
+Time:        837.5ms

@@ -1,0 +1,7 @@
+GT:   7558<CHUNK>6<CHUNK>2<CHUNK>9786
+PRED: 5<CHUNK>998<CHUNK>7<CHUNK>6<CHUNK>855<CHUNK>7<CHUNK>
+Exact match: 0.0
+Digit acc:   0.1000
+Chunk F1:    0.6667
+Steps:       10
+Time:        886.4ms

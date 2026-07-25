@@ -1,0 +1,7 @@
+GT:   2<CHUNK>0293<CHUNK>3<CHUNK>9<CHUNK>854
+PRED: 4<CHUNK>53<CHUNK>820<CHUNK>93<CHUNK>9<CHUNK>2<CHUNK>
+Exact match: 0.0
+Digit acc:   0.1000
+Chunk F1:    0.4000
+Steps:       10
+Time:        842.2ms

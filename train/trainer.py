@@ -12,14 +12,23 @@ Orchestrates:
   - Metrics saving to JSON
 
 Training Flow per Batch:
-  1. Backbone: image → node_embeddings + cls_token + heatmap_logits
+  1. Backbone: image -> node_embeddings + cls_token + heatmap_logits
   2. Heatmap Loss: focal_loss(heatmap_logits, heatmap_targets)
   3. For each sample in batch:
      a. Unpad graph, attach node_embeddings
-     b. Controller.forward_train(graph, gt_sequence, cls_token)
+     b. Controller.forward_train(graph, gt_sequence, cls_token, sampling_ratio)
      c. Accumulate controller losses
   4. Total loss = heatmap_loss + avg_controller_loss
   5. Backprop + gradient clip + optimizer step
+
+[SCHEDULED SAMPLING] To combat exposure bias (the model's chunking degrades
+when trained purely on the GT trajectory but deployed on its own trajectory),
+the trainer grows a sampling_ratio from 0 to scheduled_sampling_max over the
+first scheduled_sampling_ramp_epochs. On each training step, with probability
+sampling_ratio, the controller uses its own READ/CHUNK prediction to update
+h_content instead of the GT action. This teaches the model to handle its own
+divergent recurrent state. Validation always uses sampling_ratio=0 (pure
+teacher forcing) for a clean loss signal.
 """
 
 import torch
@@ -70,6 +79,12 @@ class TrainerConfig:
     digit_loss_weight: float = 1.0
     action_loss_weight: float = 1.0
     jump_loss_weight: float = 1.0
+
+    # === [SCHEDULED SAMPLING] ===
+    # Grows from 0 to scheduled_sampling_max over scheduled_sampling_ramp_epochs.
+    # Set scheduled_sampling_max=0 to disable (pure teacher forcing, backward compatible).
+    scheduled_sampling_max: float = 0.5
+    scheduled_sampling_ramp_epochs: int = 20
 
     # === Evaluation ===
     val_every_n_epochs: int = 1
@@ -212,6 +227,9 @@ class Trainer:
         self.train_history: List[Dict] = []
         self.val_history: List[Dict] = []
 
+        # [SCHEDULED SAMPLING] Current sampling ratio (grows over training)
+        self.sampling_ratio = 0.0
+
         # Create directories
         os.makedirs(trainer_config.checkpoint_dir, exist_ok=True)
         os.makedirs(trainer_config.metrics_dir, exist_ok=True)
@@ -222,6 +240,8 @@ class Trainer:
         print(f"[Trainer] Controller params: {sum(p.numel() for p in self.controller.parameters()):,}")
         print(f"[Trainer] Checkpoints: {trainer_config.checkpoint_dir}")
         print(f"[Trainer] Metrics: {trainer_config.metrics_dir}")
+        print(f"[Trainer] Scheduled sampling: 0 -> {trainer_config.scheduled_sampling_max} "
+              f"over {trainer_config.scheduled_sampling_ramp_epochs} epochs")
 
     def _build_scheduler(self):
         """Build learning rate scheduler."""
@@ -254,6 +274,15 @@ class Trainer:
 
         for epoch in range(self.current_epoch, self.tcfg.num_epochs):
             self.current_epoch = epoch
+
+            # [SCHEDULED SAMPLING] Grow sampling ratio from 0 to max
+            # over the ramp period. After the ramp, it stays at max.
+            ramp = self.tcfg.scheduled_sampling_ramp_epochs
+            ss_max = self.tcfg.scheduled_sampling_max
+            if ramp > 0 and epoch < ramp:
+                self.sampling_ratio = ss_max * (epoch + 1) / ramp
+            else:
+                self.sampling_ratio = ss_max
 
             # ----------------------------------------------------------
             # 1. Train one epoch
@@ -318,7 +347,7 @@ class Trainer:
                 self.scheduler.step()
 
             current_lr = self.optimizer.param_groups[1]['lr']
-            print(f"  LR: {current_lr:.2e}")
+            print(f"  LR: {current_lr:.2e}  sampling_ratio: {self.sampling_ratio:.3f}")
 
         # ----------------------------------------------------------
         # Final summary
@@ -337,6 +366,8 @@ class Trainer:
                 'max_digits': self.dcfg.max_digits,
                 'noise_sigma': self.dcfg.noise_sigma,
                 'max_chunk_size': self.dcfg.max_chunk_size,
+                'scheduled_sampling_max': self.tcfg.scheduled_sampling_max,
+                'scheduled_sampling_ramp_epochs': self.tcfg.scheduled_sampling_ramp_epochs,
             },
         })
 
@@ -412,7 +443,7 @@ class Trainer:
 
         1. Backbone forward (batched).
         2. Heatmap loss.
-        3. Controller forward (per-sample, teacher forcing).
+        3. Controller forward (per-sample, teacher forcing + scheduled sampling).
         4. Backprop + clip + step.
         """
         self.optimizer.zero_grad()
@@ -450,11 +481,14 @@ class Trainer:
                 graph.node_embeddings = node_embeddings_all[box_mask]
                 cls_token_i = cls_tokens[i]
 
+                # [SCHEDULED SAMPLING] Pass the current sampling_ratio so the
+                # controller randomly uses its own prediction to update h_content.
                 controller_out = self.controller.forward_train(
                     graph=graph,
                     gt_sequence=gt_sequence,
                     cls_token=cls_token_i,
-                    device=self.device
+                    device=self.device,
+                    sampling_ratio=self.sampling_ratio
                 )
 
                 if controller_out.digit_loss is not None:
@@ -502,7 +536,7 @@ class Trainer:
 
     @torch.no_grad()
     def validate(self, epoch: int) -> Dict[str, float]:
-        """Run validation loop."""
+        """Run validation loop. Always uses pure teacher forcing (sampling_ratio=0)."""
         self.backbone.eval()
         self.controller.eval()
 
@@ -542,8 +576,11 @@ class Trainer:
                 graph.node_embeddings = node_embeddings_all[box_mask]
                 cls_token_i = cls_tokens[i]
 
+                # [SCHEDULED SAMPLING] Validation always uses sampling_ratio=0
+                # (pure teacher forcing) for a clean, comparable loss signal.
                 out = self.controller.forward_train(
-                    graph, sample_data['gt_sequence'], cls_token_i, self.device
+                    graph, sample_data['gt_sequence'], cls_token_i, self.device,
+                    sampling_ratio=0.0
                 )
 
                 if out.digit_loss is not None:
@@ -726,6 +763,8 @@ def main():
         digit_loss_weight=1.0,
         action_loss_weight=1.0,
         jump_loss_weight=1.0,
+        scheduled_sampling_max=0.5,
+        scheduled_sampling_ramp_epochs=20,
         val_every_n_epochs=1,
         ood_eval_every_n_epochs=10,
         ood_eval_lengths=[100, 200],

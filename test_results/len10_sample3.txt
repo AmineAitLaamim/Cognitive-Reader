@@ -1,0 +1,7 @@
+GT:   3<CHUNK>7020<CHUNK>7<CHUNK>4<CHUNK>697
+PRED: 4<CHUNK>3<CHUNK>010<CHUNK>97<CHUNK>07<CHUNK>9<CHUNK>
+Exact match: 0.0
+Digit acc:   0.2000
+Chunk F1:    0.6000
+Steps:       10
+Time:        873.3ms
