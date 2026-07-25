@@ -3,20 +3,19 @@
 #
 # Pipeline:
 # 1. Environment setup (clone-or-PULL to LOCAL disk, not Drive)
-# 2. Configuration (OOD lengths lowered to physically realizable values)
+# 2. Configuration (checkpoints on Drive for persistence; logs on local)
 # 3. Data preview (GATE 1: Nodes: 20) + curriculum histogram (GATE 2)
-# 4. Clean slate (deletes LOCAL run dirs; never resumes the flat-5 weights)
-# 5. Detector pre-training (dataset imported from data/detector_dataset.py)
-# 6. Joint training on LOCAL SSD (avoids the Drive Errno-107 crash)
+# 4. Clean slate (deletes Drive + local run dirs for a fresh start)
+# 5. Detector pre-training (checkpoint saved to Drive)
+# 6. Joint training (checkpoints saved to Drive every epoch)
 # 7. Training curves
-# 8. OOD evaluation at 30/40/50/60 (all feasible at 640 / r=80)
+# 8. OOD evaluation at 30/40/50/60
 # 9. Visualization
-# 10. Save + best-effort export to Drive
+# 10. Save eval results to Drive
 #
-# MANGLE-PROOF RULE (why this file survives your editor): no double-underscore
-# tokens, no leading-underscore names, no triple-quoted strings, and no
-# underscore immediately before * or ' in any CODE cell. Markdown cells are free.
-# Edit THIS file in VS Code; convert to .ipynb with:  jupytext --to notebook train_colab.py
+# MANGLE-PROOF RULE: no double-underscore tokens, no leading-underscore names,
+# no triple-quoted strings, no underscore immediately before * or ' in code cells.
+# Edit THIS file in VS Code; convert with: jupytext --to notebook train_colab.py
 
 # %% [markdown]
 # ## 1. Environment Setup
@@ -37,9 +36,9 @@ else:
     print('WARNING: No GPU. Runtime -> Change runtime type -> GPU')
 
 # %%
-# !pip install -q torch torchvision
-# !pip install -q Pillow matplotlib tensorboard pyyaml tqdm
-# !pip install -q jupytext
+!pip install -q torch torchvision
+!pip install -q Pillow matplotlib tensorboard pyyaml tqdm
+!pip install -q jupytext
 
 # %%
 import os
@@ -49,14 +48,18 @@ drive.mount('/content/drive')
 PROJECT_DIR = '/content/Cognitive-Reader'
 DRIVE_DIR = '/content/drive/MyDrive/cognitive_reader'
 RUN_DIR = '/content/run'
+
+# Create BOTH dirs at the start so Drive folder exists immediately
 os.makedirs(RUN_DIR, exist_ok=True)
+os.makedirs(DRIVE_DIR, exist_ok=True)
+print('Local run dir:', RUN_DIR)
+print('Drive dir:', DRIVE_DIR)
 
 # %%
-# Clone on first run, PULL on every later run (the old `clone || true` never pulled,
-# so a re-used runtime kept the first clone = old broken code).
+# Clone on first run, PULL on every later run.
 repo = 'https://github.com/AmineAitLaamim/Cognitive-Reader'
 if os.path.isdir(os.path.join(PROJECT_DIR, '.git')):
-    print('repo present -> pulling latest (makes your pushes take effect)')
+    print('repo present -> pulling latest')
     os.system('git -C %s pull' % PROJECT_DIR)
 else:
     print('first run -> cloning repo')
@@ -91,10 +94,13 @@ print('All imports successful')
 
 # %% [markdown]
 # ## 2. Configuration
+#
+# Checkpoints and metrics go to **Drive** (persistent across restarts).
+# Logs go to **local** (write-heavy, don't need persistence).
+# This avoids the Errno-107 crash (which was caused by cwd and log_dir
+# being on the Drive FUSE mount, not by checkpoint writes).
 
 # %%
-# FRESH_RETRAIN: True deletes LOCAL run dirs and retrains detector + joint from
-# scratch. Set False ONLY to resume an interrupted run that started with the fixed code.
 FRESH_RETRAIN = True
 
 dataset_config = DatasetConfig(
@@ -128,8 +134,8 @@ trainer_config = TrainerConfig(
     ood_eval_every_n_epochs=10,
     ood_eval_lengths=[60],
     ood_eval_samples=10,
-    checkpoint_dir=RUN_DIR + '/checkpoints',
-    metrics_dir=RUN_DIR + '/metrics',
+    checkpoint_dir=DRIVE_DIR + '/checkpoints',
+    metrics_dir=DRIVE_DIR + '/metrics',
     log_dir=RUN_DIR + '/logs',
     save_every_n_epochs=10,
     log_every_n_steps=25,
@@ -142,6 +148,8 @@ print('Dataset: %d-%d digits, %d samples/epoch' % (
 print('Training: %d epochs, batch=%d, lr=%s' % (
     trainer_config.num_epochs, trainer_config.batch_size, trainer_config.learning_rate))
 print('AMP:', trainer_config.use_amp, ' FRESH_RETRAIN:', FRESH_RETRAIN)
+print('Checkpoints -> Drive:', trainer_config.checkpoint_dir)
+print('Logs -> Local:', trainer_config.log_dir)
 
 # %% [markdown]
 # ## 3. Data Preview (GATE 1) and curriculum histogram (GATE 2)
@@ -215,25 +223,29 @@ except Exception as err:
 
 # %% [markdown]
 # ## 4. Clean slate (only when FRESH_RETRAIN is True)
+#
+# Deletes Drive checkpoints + metrics AND local logs so we start completely fresh.
 
 # %%
 if FRESH_RETRAIN:
     import shutil
-    for folder in ['checkpoints', 'metrics', 'logs']:
-        path = RUN_DIR + '/' + folder
+    for folder in ['checkpoints', 'metrics']:
+        path = DRIVE_DIR + '/' + folder
         if os.path.isdir(path):
             shutil.rmtree(path)
-            print('deleted', path)
+            print('deleted (Drive)', path)
+    logpath = RUN_DIR + '/logs'
+    if os.path.isdir(logpath):
+        shutil.rmtree(logpath)
+        print('deleted (local)', logpath)
     print('clean slate done: detector + joint start from scratch')
 else:
-    print('FRESH_RETRAIN False -> keeping LOCAL checkpoints (resume mode)')
+    print('FRESH_RETRAIN False -> keeping existing checkpoints (resume mode)')
 
 # %% [markdown]
 # ## 5. Detector Pre-Training
 #
-# The dataset class (with its init/len/getitem) lives in data/detector_dataset.py
-# so those names survive any editor. Imported here, never redefined.
-# This pretrain is ~9 min and always runs on a clean slate (guaranteed correct).
+# Checkpoint saved to Drive so it survives runtime restarts.
 
 # %%
 from data.detector_dataset import make_det_loaders
@@ -253,7 +265,7 @@ det_trainer_config = DetectorTrainerConfig(
     backbone_lr=1e-5,
     batch_size=8,
     freeze_backbone_epochs=3,
-    checkpoint_dir=RUN_DIR + '/checkpoints/detector',
+    checkpoint_dir=DRIVE_DIR + '/checkpoints/detector',
     device=str(device),
 )
 
@@ -267,9 +279,13 @@ det_trainer = DetectorTrainer(
 
 det_trainer.fit(det_train_loader, det_val_loader)
 print('Detector pre-training complete')
+print('Detector checkpoint saved to Drive:', det_trainer_config.checkpoint_dir)
 
 # %% [markdown]
 # ## 6. Joint Training
+#
+# Checkpoints saved to Drive every epoch (best) and every 10 epochs (periodic).
+# Logs stay on local disk to avoid Drive FUSE write pressure.
 
 # %%
 trainer = Trainer(trainer_config, dataset_config)
@@ -277,12 +293,9 @@ det_trainer.load_into_backbone(trainer.backbone)
 print('Pre-trained backbone loaded into full model')
 
 # %%
-# AUTO-RESUME from LOCAL checkpoints. After a clean slate this finds nothing.
-# The glob uses 'checkpoint*.pt' (no underscore) and filters out 'best' by name,
-# then sorts by modification time, so it never parses the epoch number from the
-# filename (which is where underscore-before-punctuation literals get mangled).
+# AUTO-RESUME from Drive checkpoints. After a clean slate this finds nothing.
 import glob
-ckpt_dir = RUN_DIR + '/checkpoints'
+ckpt_dir = DRIVE_DIR + '/checkpoints'
 resume_path = None
 if os.path.isdir(ckpt_dir):
     periodic = [p for p in glob.glob(os.path.join(ckpt_dir, 'checkpoint*.pt'))
@@ -304,6 +317,7 @@ else:
 # %%
 trainer.fit()
 print('Joint training complete')
+print('Checkpoints saved to Drive:', trainer_config.checkpoint_dir)
 
 # %% [markdown]
 # ## 7. Training Curves
@@ -334,14 +348,13 @@ plt.show()
 # %% [markdown]
 # ## 8. OOD Evaluation
 #
-# Lengths 30/40/50/60 are all feasible at 640 / r=80. The old [50,100,200,500]
-# would now hard-crash on 100 because the fixed generator raises on infeasible N.
+# Lengths 30/40/50/60 are all feasible at 640 / r=80.
 
 # %%
 from evaluate import load_model, evaluate_length
 
 model = load_model(
-    checkpoint_path=RUN_DIR + '/checkpoints/checkpoint_best.pt',
+    checkpoint_path=DRIVE_DIR + '/checkpoints/checkpoint_best.pt',
     device=device, radius=80.0, noise_sigma=3.0, r_infer_multiplier=1.2,
 )
 
@@ -436,7 +449,10 @@ print('Digit acc:   %.4f' % result['metrics']['digit_accuracy'])
 print('Chunk F1:    %.4f' % result['metrics']['chunk_f1'])
 
 # %% [markdown]
-# ## 10. Save results (local) and export to Drive
+# ## 10. Save eval results to Drive
+#
+# Checkpoints are already on Drive (saved during training).
+# This cell saves the eval results JSON.
 
 # %%
 import json
@@ -453,28 +469,19 @@ results_data = {
     'ood_evaluation': {str(k): v for k, v in results_by_length.items()},
     'ood_analysis': ood_analysis,
 }
-results_path = RUN_DIR + '/eval_results.json'
+results_path = DRIVE_DIR + '/eval_results.json'
 with open(results_path, 'w') as f:
     json.dump(results_data, f, indent=2, default=str)
-print('Results saved to:', results_path)
-
-try:
-    import shutil
-    os.makedirs(DRIVE_DIR, exist_ok=True)
-    shutil.copytree(RUN_DIR + '/checkpoints', DRIVE_DIR + '/checkpoints', dirs_exist_ok=True)
-    if os.path.isdir(RUN_DIR + '/metrics'):
-        shutil.copytree(RUN_DIR + '/metrics', DRIVE_DIR + '/metrics', dirs_exist_ok=True)
-    shutil.copy(results_path, DRIVE_DIR + '/eval_results.json')
-    print('Exported to Drive:', DRIVE_DIR)
-except Exception as err:
-    print('Drive export WARNING:', repr(err), '(local results safe at', RUN_DIR, ')')
+print('Eval results saved to Drive:', results_path)
+print('Checkpoints on Drive:', DRIVE_DIR + '/checkpoints/')
+print('Metrics on Drive:', DRIVE_DIR + '/metrics/')
 
 # %% [markdown]
 # ## 11. Download checkpoint (optional)
 
 # %%
 from google.colab import files
-best_ckpt = RUN_DIR + '/checkpoints/checkpoint_best.pt'
+best_ckpt = DRIVE_DIR + '/checkpoints/checkpoint_best.pt'
 if os.path.exists(best_ckpt):
     print('Downloading:', best_ckpt)
     files.download(best_ckpt)
@@ -483,6 +490,12 @@ else:
 
 # %% [markdown]
 # ---
+# Training complete. All checkpoints are on your Google Drive at:
+# `MyDrive/cognitive_reader/checkpoints/checkpoint_best.pt`
+#
+# If the runtime disconnects mid-training, restart and Run-all with
+# `FRESH_RETRAIN = False` to resume from the last Drive checkpoint.
+#
 # Read the result with rulers that match the architecture: per-node digit accuracy
 # (already 1.0), the contiguity probe (pure_frac / intra_changes), and chunk-boundary
 # F1 on boundary edges. NOT positional exact_match / digit_accuracy, which stay low
