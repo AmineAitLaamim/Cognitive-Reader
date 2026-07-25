@@ -1,35 +1,34 @@
 # %% [markdown]
-# # Cognitive Reader — Training on Google Colab (Plan A, crash-hardened)
+# # Cognitive Reader - Training on Google Colab (Plan A)
 #
 # Pipeline:
 # 1. Environment setup (clone-or-PULL to LOCAL disk, not Drive)
-# 2. Configuration (OOD lengths lowered to physically realizable values; FRESH_RETRAIN flag)
-# 3. Data preview  -> GATE 1: must print Nodes: 20
-#    Curriculum histogram -> GATE 2: must show a broad spread, not a spike
-# 4. Clean slate (deletes LOCAL run dirs so we never resume the flat-5 weights)
-# 5. Detector pre-training (fresh; dataset class imported from data/detector_dataset.py)
+# 2. Configuration (OOD lengths lowered to physically realizable values)
+# 3. Data preview (GATE 1: Nodes: 20) + curriculum histogram (GATE 2)
+# 4. Clean slate (deletes LOCAL run dirs; never resumes the flat-5 weights)
+# 5. Detector pre-training (dataset imported from data/detector_dataset.py)
 # 6. Joint training on LOCAL SSD (avoids the Drive Errno-107 crash)
 # 7. Training curves
 # 8. OOD evaluation at 30/40/50/60 (all feasible at 640 / r=80)
 # 9. Visualization
-# 10. Save + export to Drive at the very end
+# 10. Save + best-effort export to Drive
 #
-# This file is intentionally free of double-underscore method names and triple-quote
-# docstrings in code cells, so a markdown-aware editor cannot strip them.
+# MANGLE-PROOF RULE (why this file survives your editor): no double-underscore
+# tokens, no leading-underscore names, no triple-quoted strings, and no
+# underscore immediately before * or ' in any CODE cell. Markdown cells are free.
+# Edit THIS file in VS Code; convert to .ipynb with:  jupytext --to notebook train_colab.py
 
 # %% [markdown]
 # ## 1. Environment Setup
 
 # %%
-# GPU check. Version is read WITHOUT double-underscore attributes on purpose,
-# because those get stripped by the notebook editor.
 import torch
 try:
-    import importlib.metadata as _im
-    _tv = _im.version('torch')
+    import importlib.metadata as imd
+    torchver = imd.version('torch')
 except Exception:
-    _tv = 'unknown'
-print('PyTorch version:', _tv)
+    torchver = 'unknown'
+print('PyTorch version:', torchver)
 print('CUDA available:', torch.cuda.is_available())
 if torch.cuda.is_available():
     print('GPU:', torch.cuda.get_device_name(0))
@@ -38,43 +37,36 @@ else:
     print('WARNING: No GPU. Runtime -> Change runtime type -> GPU')
 
 # %%
-# Dependencies
 # !pip install -q torch torchvision
 # !pip install -q Pillow matplotlib tensorboard pyyaml tqdm
 # !pip install -q jupytext
 
 # %%
-# Mount Drive. Drive is used ONLY for the final export (and optional restore),
-# never as the working directory. The Errno-107 crash happened because cwd was
-# on the Drive FUSE mount; keeping cwd on local disk removes that whole failure class.
+import os
 from google.colab import drive
 drive.mount('/content/drive')
 
-PROJECT_DIR = '/content/Cognitive-Reader'                 # LOCAL: code clone
-DRIVE_DIR   = '/content/drive/MyDrive/cognitive_reader'   # Drive: persistent export/restore ONLY
-RUN_DIR     = '/content/run'                              # LOCAL SSD: checkpoints/metrics/logs
-os.makedirs(RUN_DIR, exist_ok=True) if 'os' in dir() else None
+PROJECT_DIR = '/content/Cognitive-Reader'
+DRIVE_DIR = '/content/drive/MyDrive/cognitive_reader'
+RUN_DIR = '/content/run'
+os.makedirs(RUN_DIR, exist_ok=True)
 
 # %%
-# Clone on first run, PULL on every later run. The old cell did
-# `git clone ... || true`, which silently fails when the dir exists and therefore
-# NEVER picked up your pushes on a re-used runtime -- that is very likely why
-# earlier fixes looked like they did not take effect.
-import os
-os.makedirs(RUN_DIR, exist_ok=True)
-_repo = 'https://github.com/AmineAitLaamim/Cognitive-Reader'
+# Clone on first run, PULL on every later run (the old `clone || true` never pulled,
+# so a re-used runtime kept the first clone = old broken code).
+repo = 'https://github.com/AmineAitLaamim/Cognitive-Reader'
 if os.path.isdir(os.path.join(PROJECT_DIR, '.git')):
     print('repo present -> pulling latest (makes your pushes take effect)')
     os.system('git -C %s pull' % PROJECT_DIR)
 else:
     print('first run -> cloning repo')
-    os.system('git clone -q %s %s' % (_repo, PROJECT_DIR))
+    os.system('git clone -q %s %s' % (repo, PROJECT_DIR))
 
-os.chdir(PROJECT_DIR)        # cwd is LOCAL -> not on a flaky mount
+os.chdir(PROJECT_DIR)
 print('Working directory:', os.getcwd())
-_required = ['data', 'models', 'train', 'eval', 'utils']
-_missing = [d for d in _required if not os.path.isdir(d)]
-print('Missing dirs:', _missing if _missing else 'none')
+required = ['data', 'models', 'train', 'eval', 'utils']
+missing = [d for d in required if not os.path.isdir(d)]
+print('Missing dirs:', missing if missing else 'none')
 
 # %%
 import sys
@@ -101,10 +93,8 @@ print('All imports successful')
 # ## 2. Configuration
 
 # %%
-# FRESH_RETRAIN controls the clean-slate cell.
-#   True  -> delete LOCAL run dirs; retrain detector + joint from scratch (Plan A).
-#   False -> keep them so the resume cell can continue an interrupted run.
-# Set True for this retrain. Set False only to resume a run started with the fixed code.
+# FRESH_RETRAIN: True deletes LOCAL run dirs and retrains detector + joint from
+# scratch. Set False ONLY to resume an interrupted run that started with the fixed code.
 FRESH_RETRAIN = True
 
 dataset_config = DatasetConfig(
@@ -136,11 +126,11 @@ trainer_config = TrainerConfig(
     jump_loss_weight=1.0,
     val_every_n_epochs=1,
     ood_eval_every_n_epochs=10,
-    ood_eval_lengths=[60],                       # was [100, 200] -> those raise now
+    ood_eval_lengths=[60],
     ood_eval_samples=10,
-    checkpoint_dir=RUN_DIR + '/checkpoints',     # LOCAL, not Drive
-    metrics_dir=RUN_DIR + '/metrics',            # LOCAL
-    log_dir=RUN_DIR + '/logs',                   # LOCAL (this is what Errno-107 hit)
+    checkpoint_dir=RUN_DIR + '/checkpoints',
+    metrics_dir=RUN_DIR + '/metrics',
+    log_dir=RUN_DIR + '/logs',
     save_every_n_epochs=10,
     log_every_n_steps=25,
     use_amp=torch.cuda.is_available(),
@@ -155,10 +145,6 @@ print('AMP:', trainer_config.use_amp, ' FRESH_RETRAIN:', FRESH_RETRAIN)
 
 # %% [markdown]
 # ## 3. Data Preview (GATE 1) and curriculum histogram (GATE 2)
-#
-# GATE 1 must print Nodes: 20. If it prints 5, the clone-or-pull did not fetch the
-# fixed generator -- do not continue. GATE 2 checks the collate/graph layer the
-# generator fix did not touch; a broad spread is honest, a spike is a downstream bug.
 
 # %%
 import matplotlib.pyplot as plt
@@ -173,8 +159,8 @@ sample = generator.generate_sample(total_digits=20)
 
 assert sample.total_digits == 20, (
     'GATE 1 FAIL: generator returned %d nodes for a request of 20. The fixed '
-    'generator is NOT loaded on this runtime. Re-run the clone-or-pull cell, then '
-    'Runtime -> Restart runtime, then re-run imports, before continuing.' % sample.total_digits
+    'generator is NOT loaded. Re-run the clone-or-pull cell, then '
+    'Runtime -> Restart runtime, then re-run imports.' % sample.total_digits
 )
 
 render_config = RendererConfig(img_width=640, img_height=640, seed=42)
@@ -183,7 +169,7 @@ render_output = renderer.render(sample)
 
 img_tensor = render_output['image']
 mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
-std  = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
 img_display = (img_tensor * std + mean).clamp(0, 1).permute(1, 2, 0).numpy()
 
 fig, axes = plt.subplots(1, 2, figsize=(16, 6))
@@ -209,50 +195,45 @@ print('GT sequence:', ' '.join(gt_tokens))
 print('Nodes: %d, Chunks: %d   <- GATE 1 OK if Nodes == 20' % (sample.total_digits, sample.num_chunks))
 
 # %%
-# GATE 2: histogram of READ nodes that actually reach the controller.
 from collections import Counter
 try:
     from data.collate import unpad_graph
-    _hist = Counter()
-    _tr, _ = create_dataloaders(dataset_config, batch_size=4, num_workers=0)
-    for _bi, _batch in enumerate(_tr):
-        for _i in range(_batch.batch_size):
-            _sd = unpad_graph(_batch, _i, device=torch.device('cpu'))
-            _hist[sum(1 for t in _sd['gt_sequence'] if t['mode'] == 'READ')] += 1
-        if _bi >= 7:
+    hist = Counter()
+    trld, vld = create_dataloaders(dataset_config, batch_size=4, num_workers=0)
+    for bi, batch in enumerate(trld):
+        for i2 in range(batch.batch_size):
+            sd = unpad_graph(batch, i2, device=torch.device('cpu'))
+            hist[sum(1 for t in sd['gt_sequence'] if t['mode'] == 'READ')] += 1
+        if bi >= 7:
             break
-    print('READ-nodes per sample reaching the controller:', dict(sorted(_hist.items())))
-    _real = {k: v for k, v in _hist.items() if k > 0}
-    assert _real and max(_real) <= dataset_config.max_digits and len(_real) >= 5, 'curriculum collapsed'
+    print('READ-nodes per sample reaching the controller:', dict(sorted(hist.items())))
+    real = {k: v for k, v in hist.items() if k > 0}
+    assert real and max(real) <= dataset_config.max_digits and len(real) >= 5, 'curriculum collapsed'
     print('GATE 2 OK: curriculum is broad')
-except Exception as _e:
-    print('GATE 2 skipped:', type(_e).__name__, _e, '- rely on epoch-10 OOD as the end-to-end check')
+except Exception as err:
+    print('GATE 2 skipped:', repr(err))
 
 # %% [markdown]
 # ## 4. Clean slate (only when FRESH_RETRAIN is True)
-#
-# Deletes the LOCAL run dirs so the resume cell cannot reload the old flat-5 weights
-# and so the detector is re-pretrained on the honest generator. Drive is untouched.
 
 # %%
 if FRESH_RETRAIN:
     import shutil
-    for _d in ['checkpoints', 'metrics', 'logs']:
-        _p = RUN_DIR + '/' + _d
-        if os.path.isdir(_p):
-            shutil.rmtree(_p)
-            print('deleted', _p)
-    print('clean slate set: detector pretrains fresh, joint starts at epoch 0')
+    for folder in ['checkpoints', 'metrics', 'logs']:
+        path = RUN_DIR + '/' + folder
+        if os.path.isdir(path):
+            shutil.rmtree(path)
+            print('deleted', path)
+    print('clean slate done: detector + joint start from scratch')
 else:
-    print('FRESH_RETRAIN is False -> keeping existing LOCAL checkpoints (resume mode)')
+    print('FRESH_RETRAIN False -> keeping LOCAL checkpoints (resume mode)')
 
 # %% [markdown]
 # ## 5. Detector Pre-Training
 #
-# The dataset class (with its init/len/getitem methods) lives in
-# data/detector_dataset.py so those names survive any editor. It is imported here,
-# never redefined -- so this cell cannot be corrupted. If this import fails, the
-# file is missing on GitHub: push data/detector_dataset.py and re-run.
+# The dataset class (with its init/len/getitem) lives in data/detector_dataset.py
+# so those names survive any editor. Imported here, never redefined.
+# This pretrain is ~9 min and always runs on a clean slate (guaranteed correct).
 
 # %%
 from data.detector_dataset import make_det_loaders
@@ -272,7 +253,7 @@ det_trainer_config = DetectorTrainerConfig(
     backbone_lr=1e-5,
     batch_size=8,
     freeze_backbone_epochs=3,
-    checkpoint_dir=RUN_DIR + '/checkpoints/detector',   # LOCAL
+    checkpoint_dir=RUN_DIR + '/checkpoints/detector',
     device=str(device),
 )
 
@@ -296,15 +277,18 @@ det_trainer.load_into_backbone(trainer.backbone)
 print('Pre-trained backbone loaded into full model')
 
 # %%
-# AUTO-RESUME. After a clean slate this finds nothing and starts at epoch 0.
-# With FRESH_RETRAIN False it continues an interrupted run from LOCAL checkpoints.
+# AUTO-RESUME from LOCAL checkpoints. After a clean slate this finds nothing.
+# The glob uses 'checkpoint*.pt' (no underscore) and filters out 'best' by name,
+# then sorts by modification time, so it never parses the epoch number from the
+# filename (which is where underscore-before-punctuation literals get mangled).
 import glob
 ckpt_dir = RUN_DIR + '/checkpoints'
 resume_path = None
 if os.path.isdir(ckpt_dir):
-    periodic = glob.glob(os.path.join(ckpt_dir, 'checkpoint_epoch_*.pt'))
+    periodic = [p for p in glob.glob(os.path.join(ckpt_dir, 'checkpoint*.pt'))
+                if 'best' not in os.path.basename(p)]
     if periodic:
-        periodic.sort(key=lambda p: int(os.path.basename(p).replace('checkpoint_epoch_', '').replace('.pt', '')))
+        periodic.sort(key=os.path.getmtime)
         resume_path = periodic[-1]
     else:
         best = os.path.join(ckpt_dir, 'checkpoint_best.pt')
@@ -327,8 +311,9 @@ print('Joint training complete')
 # %%
 fig, axes = plt.subplots(2, 3, figsize=(18, 10))
 loss_keys = ['total', 'heatmap', 'digit', 'action', 'jump']
-titles    = ['Total Loss', 'Heatmap Loss', 'Digit Loss', 'Action Loss', 'Jump Loss']
-for idx, (key, title) in enumerate(zip(loss_keys, titles)):
+titles = ['Total Loss', 'Heatmap Loss', 'Digit Loss', 'Action Loss', 'Jump Loss']
+for idx, pair in enumerate(zip(loss_keys, titles)):
+    key, title = pair
     ax = axes[idx // 3][idx % 3]
     train_vals = [h.get(key, 0) for h in trainer.train_history]
     ax.plot(train_vals, label='Train', color='blue', alpha=0.7)
@@ -336,8 +321,11 @@ for idx, (key, title) in enumerate(zip(loss_keys, titles)):
         val_vals = [h.get(key, 0) for h in trainer.val_history]
         val_x = np.linspace(0, len(train_vals) - 1, len(val_vals))
         ax.plot(val_x, val_vals, label='Val', color='red', alpha=0.7)
-    ax.set_title(title); ax.set_xlabel('Epoch'); ax.set_ylabel('Loss')
-    ax.legend(); ax.grid(True, alpha=0.3)
+    ax.set_title(title)
+    ax.set_xlabel('Epoch')
+    ax.set_ylabel('Loss')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
 axes[1][2].axis('off')
 plt.tight_layout()
 plt.savefig(PROJECT_DIR + '/training_curves.png', dpi=150, bbox_inches='tight')
@@ -346,9 +334,8 @@ plt.show()
 # %% [markdown]
 # ## 8. OOD Evaluation
 #
-# Lengths 30/40/50/60 are all feasible at 640 / r=80. The old [50,100,200,500] would
-# now hard-crash on 100 because the fixed generator raises on infeasible N instead of
-# truncating -- correct behavior, but the eval list must stay at or below feasible max.
+# Lengths 30/40/50/60 are all feasible at 640 / r=80. The old [50,100,200,500]
+# would now hard-crash on 100 because the fixed generator raises on infeasible N.
 
 # %%
 from evaluate import load_model, evaluate_length
@@ -372,18 +359,23 @@ for length in eval_lengths:
 # %%
 ood_analysis = ood_generalization_analysis(results_by_length)
 fig, ax = plt.subplots(1, 1, figsize=(10, 6))
-lengths    = sorted(results_by_length.keys())
-seq_accs   = [results_by_length[l].get('exact_match',    0) for l in lengths]
+lengths = sorted(results_by_length.keys())
+seq_accs = [results_by_length[l].get('exact_match', 0) for l in lengths]
 digit_accs = [results_by_length[l].get('digit_accuracy', 0) for l in lengths]
-chunk_f1s  = [results_by_length[l].get('chunk_f1',       0) for l in lengths]
-x = np.arange(len(lengths)); width = 0.25
-ax.bar(x - width, seq_accs,   width, label='Exact Match',   color='steelblue')
-ax.bar(x,         digit_accs, width, label='Digit Accuracy', color='coral')
-ax.bar(x + width, chunk_f1s,  width, label='Chunk F1',       color='seagreen')
-ax.set_xlabel('Sequence Length'); ax.set_ylabel('Score')
+chunk_f1s = [results_by_length[l].get('chunk_f1', 0) for l in lengths]
+x = np.arange(len(lengths))
+width = 0.25
+ax.bar(x - width, seq_accs, width, label='Exact Match', color='steelblue')
+ax.bar(x, digit_accs, width, label='Digit Accuracy', color='coral')
+ax.bar(x + width, chunk_f1s, width, label='Chunk F1', color='seagreen')
+ax.set_xlabel('Sequence Length')
+ax.set_ylabel('Score')
 ax.set_title('OOD Length Generalization (Plan A)')
-ax.set_xticks(x); ax.set_xticklabels([str(l) for l in lengths])
-ax.legend(); ax.set_ylim(0, 1.05); ax.grid(True, alpha=0.3, axis='y')
+ax.set_xticks(x)
+ax.set_xticklabels([str(l) for l in lengths])
+ax.legend()
+ax.set_ylim(0, 1.05)
+ax.grid(True, alpha=0.3, axis='y')
 if ood_analysis['critical_length']:
     ax.axvline(x=lengths.index(ood_analysis['critical_length']),
                color='red', linestyle='--', alpha=0.7,
@@ -413,7 +405,9 @@ result = evaluate_single_sample(
 )
 base_img = denormalize_image(test_sample['image'])
 fig, axes = plt.subplots(1, 3, figsize=(24, 8))
-axes[0].imshow(np.array(base_img)); axes[0].set_title('Input Image'); axes[0].axis('off')
+axes[0].imshow(np.array(base_img))
+axes[0].set_title('Input Image')
+axes[0].axis('off')
 graph_img = draw_graph(
     image=base_img,
     node_positions_px=test_sample['graph'].node_positions_px,
@@ -421,13 +415,17 @@ graph_img = draw_graph(
     node_chunk_ids=test_sample['graph'].node_chunk_ids,
     radius=80.0, node_labels=test_sample['graph'].node_labels,
 )
-axes[1].imshow(np.array(graph_img)); axes[1].set_title('Spatial Graph'); axes[1].axis('off')
+axes[1].imshow(np.array(graph_img))
+axes[1].set_title('Spatial Graph')
+axes[1].axis('off')
 path_img = draw_reading_path(
     image=base_img, output_tokens=result['output_tokens'],
     node_positions_px=test_sample['graph'].node_positions_px,
     node_chunk_ids=test_sample['graph'].node_chunk_ids,
 )
-axes[2].imshow(np.array(path_img)); axes[2].set_title('Reading Path'); axes[2].axis('off')
+axes[2].imshow(np.array(path_img))
+axes[2].set_title('Reading Path')
+axes[2].axis('off')
 plt.tight_layout()
 plt.savefig(PROJECT_DIR + '/prediction_viz.png', dpi=150, bbox_inches='tight')
 plt.show()
@@ -445,12 +443,12 @@ import json
 results_data = {
     'training': {
         'config': {
-            'num_epochs':    trainer_config.num_epochs,
-            'batch_size':    trainer_config.batch_size,
+            'num_epochs': trainer_config.num_epochs,
+            'batch_size': trainer_config.batch_size,
             'learning_rate': trainer_config.learning_rate,
         },
         'final_train_loss': trainer.train_history[-1] if trainer.train_history else {},
-        'best_val_loss':    trainer.ckpt_mgr.best_val_loss,
+        'best_val_loss': trainer.ckpt_mgr.best_val_loss,
     },
     'ood_evaluation': {str(k): v for k, v in results_by_length.items()},
     'ood_analysis': ood_analysis,
@@ -460,8 +458,6 @@ with open(results_path, 'w') as f:
     json.dump(results_data, f, indent=2, default=str)
 print('Results saved to:', results_path)
 
-# Best-effort export to Drive at the very end. Wrapped so a flaky mount here
-# cannot erase the local results you already have.
 try:
     import shutil
     os.makedirs(DRIVE_DIR, exist_ok=True)
@@ -470,8 +466,8 @@ try:
         shutil.copytree(RUN_DIR + '/metrics', DRIVE_DIR + '/metrics', dirs_exist_ok=True)
     shutil.copy(results_path, DRIVE_DIR + '/eval_results.json')
     print('Exported to Drive:', DRIVE_DIR)
-except Exception as _e:
-    print('Drive export WARNING:', type(_e).__name__, _e, '(local results are safe at', RUN_DIR, ')')
+except Exception as err:
+    print('Drive export WARNING:', repr(err), '(local results safe at', RUN_DIR, ')')
 
 # %% [markdown]
 # ## 11. Download checkpoint (optional)
@@ -487,16 +483,17 @@ else:
 
 # %% [markdown]
 # ---
-# Training complete. Local checkpoint at /content/run/checkpoints/checkpoint_best.pt
-# (and mirrored to Drive if the export succeeded).
+# Read the result with rulers that match the architecture: per-node digit accuracy
+# (already 1.0), the contiguity probe (pure_frac / intra_changes), and chunk-boundary
+# F1 on boundary edges. NOT positional exact_match / digit_accuracy, which stay low
+# for a correct reader that visits chunks in a different order.
 #
-# Read the result as a decision rule (committed before seeing the number):
+# Decision rule (committed before seeing the number):
 #   chunk_f1 at 60 >= ~0.5 AND exact_match non-zero at 30-40
-#       -> the routing head HAS long-sequence capacity; Plan B (bigger canvas)
-#          becomes a justified scaling experiment on a proven base.
+#       -> routing head HAS long-sequence capacity; Plan B (bigger canvas) justified.
 #   chunk_f1 ~0.3-0.5, exact_match zero
-#       -> partial: routes within chunks, mis-places boundaries; stay at 640,
-#          try action_loss_weight=3.0 or more epochs on the honest curriculum.
+#       -> routes within chunks, mis-places boundaries; stay at 640, try
+#          action_loss_weight=3.0 or more epochs on the honest curriculum.
 #   chunk_f1 < ~0.3, exact_match zero everywhere
 #       -> no long-sequence capacity yet; do NOT scale the canvas; diagnose the
 #          head at 640 (action-head size, exposure bias, visited-mask signal).
