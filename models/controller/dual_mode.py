@@ -349,12 +349,19 @@ class DualModeController(nn.Module):
                 # first chunk's identity is arbitrary, so its jump loss is
                 # skipped entirely (order-invariant reading does not need it).
                 if state.initialized:
-                    cur_pos = graph.node_positions_norm[state.current_node]      # [2], graph device
-                    cids = graph.node_chunk_ids                                   # [N], graph device
-                    cur_cid = int(cids[state.current_node].item())
-                    diff = graph.node_positions_norm - cur_pos.unsqueeze(0)       # [N, 2]
-                    d2 = (diff * diff).sum(dim=1)                                 # [N]
-                    valid = (state.visited_mask.cpu() < 0.5) & (cids != cur_cid)  # [N]
+                    # [FIX-JUMP] supervise the jump head toward the nearest
+                    # UNVISITED node outside the current chunk (a state-computable,
+                    # learnable target). The trajectory is still teacher-forced on
+                    # gt_step.node_id below; only the jump head's label changes.
+                    # [device-fix] route every tensor through `device` so the
+                    # boolean `&` never mixes cuda (graph) with cpu (state).
+                    vm = state.visited_mask.to(device)                              # [N]
+                    cids_d = graph.node_chunk_ids.to(device)                        # [N]
+                    cur_cid = int(cids_d[state.current_node].item())
+                    cur_pos = graph.node_positions_norm[state.current_node].to(device)        # [2]
+                    diff = graph.node_positions_norm.to(device) - cur_pos.unsqueeze(0)        # [N, 2]
+                    d2 = (diff * diff).sum(dim=1)                                   # [N]
+                    valid = (vm < 0.5) & (cids_d != cur_cid)                        # [N]
                     n_valid = int(valid.sum().item())
                     if n_valid > 0:
                         d2m = d2.clone()
